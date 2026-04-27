@@ -15,6 +15,7 @@ from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeat
 from .slabs import (
     CorrectivePotentialBlock,
     slab_dipole_correction_node_fields,
+    slab_dipole_correction_node_fields_source_target,
     _get_total_dipole_z,
 )
 from .utils import FIELD_CONSTANT
@@ -326,6 +327,113 @@ class NonPeriodicFeatureCorrections(torch.nn.Module):
         return self.displaced_interactions(
             batch=batch,
             positions=node_positions,
+            node_fields=node_fields,
+        )
+
+    def forward_source_target(
+        self,
+        source_feats: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volumes: torch.Tensor,
+        pbc: torch.Tensor,
+        correction_mode: Optional[int] = None,
+        correction_node_masks: Optional[dict] = None,
+    ) -> torch.Tensor:
+        source_feats_lm = (
+            source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
+        )
+        if correction_mode is None:
+            pbc_bool = pbc.to(dtype=torch.bool)
+            is_pbc_graph = pbc_bool.all(dim=1)
+            is_molecule_graph = (~pbc_bool).all(dim=1)
+            is_slab_graph = pbc_bool[:, 0] & pbc_bool[:, 1] & (~pbc_bool[:, 2])
+            if is_pbc_graph.all():
+                correction_mode = CORRECTION_MODE_PBC
+            elif is_molecule_graph.all():
+                correction_mode = CORRECTION_MODE_MOLECULE
+            elif is_slab_graph.all():
+                correction_mode = CORRECTION_MODE_SLAB
+            else:
+                correction_mode = CORRECTION_MODE_MIXED
+                correction_node_masks = {
+                    "is_molecule_node": torch.index_select(is_molecule_graph, 0, tgt_batch),
+                    "is_slab_node": torch.index_select(is_slab_graph, 0, tgt_batch),
+                }
+
+        if correction_mode == CORRECTION_MODE_PBC:
+            n_tgt = tgt_positions.size(0)
+            return tgt_positions.new_zeros(
+                (n_tgt, self.displaced_interactions.projections_dim)
+            )
+
+        if correction_mode == CORRECTION_MODE_MOLECULE:
+            node_fields = self.self_field.forward_source_target(
+                charge_coefficients=source_feats_lm,
+                src_positions=src_positions,
+                src_batch=src_batch,
+                tgt_positions=tgt_positions,
+                tgt_batch=tgt_batch,
+                volumes=volumes,
+            )
+            return self.displaced_interactions(
+                batch=tgt_batch,
+                positions=tgt_positions,
+                node_fields=node_fields,
+            )
+
+        if correction_mode == CORRECTION_MODE_SLAB:
+            node_fields = slab_dipole_correction_node_fields_source_target(
+                source_feats=source_feats_lm,
+                src_positions=src_positions,
+                src_batch=src_batch,
+                tgt_positions=tgt_positions,
+                tgt_batch=tgt_batch,
+                volumes=volumes,
+            )
+            return self.displaced_interactions(
+                batch=tgt_batch,
+                positions=tgt_positions,
+                node_fields=node_fields,
+            )
+
+        # MIXED — masks are over targets
+        if correction_node_masks is None:
+            pbc_bool = pbc.to(dtype=torch.bool)
+            is_molecule_graph = (~pbc_bool).all(dim=1)
+            is_slab_graph = pbc_bool[:, 0] & pbc_bool[:, 1] & (~pbc_bool[:, 2])
+            correction_node_masks = {
+                "is_molecule_node": torch.index_select(is_molecule_graph, 0, tgt_batch),
+                "is_slab_node": torch.index_select(is_slab_graph, 0, tgt_batch),
+            }
+
+        node_fields_molecule = self.self_field.forward_source_target(
+            charge_coefficients=source_feats_lm,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        node_fields_slab = slab_dipole_correction_node_fields_source_target(
+            source_feats=source_feats_lm,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        is_molecule = correction_node_masks["is_molecule_node"]
+        is_slab = correction_node_masks["is_slab_node"]
+        node_fields = torch.zeros_like(node_fields_molecule)
+        node_fields[is_molecule] = node_fields_molecule[is_molecule]
+        node_fields[is_slab] = node_fields_slab[is_slab]
+
+        return self.displaced_interactions(
+            batch=tgt_batch,
+            positions=tgt_positions,
             node_fields=node_fields,
         )
 
@@ -655,6 +763,188 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             features_flat = features_flat - si_terms
         if correction_mode != CORRECTION_MODE_PBC:
             features_flat = features_flat + correction_terms
+        return features_flat
+
+    # --- source-target API ----------------------------------------------------
+    # Built for MM→QM electrostatic embedding where sources (MM) and receivers
+    # (QM) are disjoint node sets. Skips the self-interaction subtraction the
+    # symmetric path applies — colocated source/target rows are NOT supported.
+
+    def precompute_geometry_source_target(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+        force_pbc_evaluator: bool = False,
+    ) -> dict:
+        if torch.any(pbc) or force_pbc_evaluator:
+            return self._pbc_precompute_geometry_source_target(
+                k_vectors=k_vectors,
+                k_norm2=k_norm2,
+                k_vector_batch=k_vector_batch,
+                k0_mask=k0_mask,
+                src_positions=src_positions,
+                src_batch=src_batch,
+                tgt_positions=tgt_positions,
+                tgt_batch=tgt_batch,
+                volume=volume,
+                pbc=pbc,
+            )
+        return self._realspace_precompute_geometry_source_target(
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+        )
+
+    def forward_source_target(
+        self, cache: dict, source_feats: torch.Tensor, pbc: torch.Tensor
+    ) -> torch.Tensor:
+        if cache.get("mode") == "realspace":
+            return self._realspace_forward_dynamic_source_target(
+                source_feats=source_feats, cache=cache
+            )
+        return self._pbc_forward_dynamic_source_target(
+            source_feats=source_feats, cache=cache
+        )
+
+    def _realspace_precompute_geometry_source_target(
+        self,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+    ) -> dict:
+        return {
+            "mode": "realspace",
+            "src_positions": src_positions,
+            "src_batch": src_batch,
+            "tgt_positions": tgt_positions,
+            "tgt_batch": tgt_batch,
+        }
+
+    def _realspace_forward_dynamic_source_target(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        return self.realspace_features.forward_source_target(
+            source_feats=source_feats,
+            src_positions=cache["src_positions"],
+            src_batch=cache["src_batch"],
+            tgt_positions=cache["tgt_positions"],
+            tgt_batch=cache["tgt_batch"],
+        )
+
+    def _pbc_precompute_geometry_source_target(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> dict:
+        inner_src = torch.matmul(k_vectors, src_positions.t())
+        mask_src = k_vector_batch[:, None] == src_batch[None, :]
+        mask_src_f = mask_src.to(dtype=inner_src.dtype)
+        cosines_src = torch.cos(inner_src) * mask_src_f
+        sines_src = torch.sin(inner_src) * mask_src_f
+
+        inner_tgt = torch.matmul(k_vectors, tgt_positions.t())
+        mask_tgt = k_vector_batch[:, None] == tgt_batch[None, :]
+        mask_tgt_f = mask_tgt.to(dtype=inner_tgt.dtype)
+        cosines_tgt = torch.cos(inner_tgt) * mask_tgt_f
+        sines_tgt = torch.sin(inner_tgt) * mask_tgt_f
+
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
+
+        volume_per_k = volume.reshape(-1)[k_vector_batch]
+        k0_mask_bool = k0_mask > 0.0
+        k_factor_coulomb = torch.zeros_like(k_norm2)
+        k_factor_coulomb[~k0_mask_bool] = 1.0 / k_norm2[~k0_mask_bool]
+        k_factor_proj = torch.ones_like(k_norm2)
+        k_factor_proj[k0_mask_bool] = 0.5
+
+        # Correction mode is determined per-target-graph (the mask we apply at
+        # the end is over target rows).
+        correction_cache = self._build_correction_cache(pbc=pbc, batch=tgt_batch)
+
+        return {
+            "mode": "pbc",
+            "k_vectors": k_vectors,
+            "k_norm2": k_norm2,
+            "k_vector_batch": k_vector_batch,
+            "k0_mask": k0_mask,
+            "volume_per_k": volume_per_k,
+            "k_factor_coulomb": k_factor_coulomb,
+            "k_factor_proj": k_factor_proj,
+            "volumes": volume.reshape(-1),
+            "src_positions": src_positions,
+            "src_batch": src_batch,
+            "tgt_positions": tgt_positions,
+            "tgt_batch": tgt_batch,
+            "pbc": pbc,
+            "cosines_src": cosines_src,
+            "sines_src": sines_src,
+            "cosines_tgt": cosines_tgt,
+            "sines_tgt": sines_tgt,
+            "density_basis_fs": density_basis_fs,
+            "feature_basis_fs": feature_basis_fs,
+            **correction_cache,
+        }
+
+    def _pbc_forward_dynamic_source_target(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        density = assemble_fourier_series_batch(
+            source_feats=source_feats,
+            cosines=cache["cosines_src"],
+            sines=cache["sines_src"],
+            density_basis_fs=cache["density_basis_fs"],
+            volume_per_k=cache["volume_per_k"],
+        )
+        potential = apply_coulomb_kernel_batch(
+            k_norm2=cache["k_norm2"],
+            density=density,
+            k_factor_coulomb=cache["k_factor_coulomb"],
+        )
+        features_si = project_to_features_batch(
+            potential=potential,
+            feature_basis_fs=cache["feature_basis_fs"],
+            cosines=cache["cosines_tgt"],
+            sines=cache["sines_tgt"],
+            k_factor_proj=cache["k_factor_proj"],
+        )
+        features_flat = features_si.reshape(features_si.size(0), -1)
+        features_flat = self._permute_output_channels(features_flat)
+
+        correction_mode = cache.get("correction_mode", CORRECTION_MODE_MIXED)
+        if correction_mode != CORRECTION_MODE_PBC:
+            correction_terms = self.non_periodic_correction_terms.forward_source_target(
+                source_feats=source_feats,
+                src_positions=cache["src_positions"],
+                src_batch=cache["src_batch"],
+                tgt_positions=cache["tgt_positions"],
+                tgt_batch=cache["tgt_batch"],
+                volumes=cache["volumes"],
+                pbc=cache["pbc"],
+                correction_mode=correction_mode,
+                correction_node_masks=cache.get("correction_node_masks"),
+            )
+            features_flat = features_flat + correction_terms
+
+        # No self-interaction subtraction: sources and targets are disjoint.
         return features_flat
 
 

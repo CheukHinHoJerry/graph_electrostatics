@@ -350,6 +350,8 @@ class DisplacedGTOExternalFieldBlock(torch.nn.Module):
         # field contains [V, E_x, E_y, E_z]
         assert field.dim() == 2
 
+        # ensure the convention is the same for now
+        # clarify whether we need external potential in the future
         if per_atom:
             # Field already evaluated at each atom position; no gauge transform.
             node_fields = field.clone()
