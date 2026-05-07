@@ -24,6 +24,13 @@ from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
 
 
+@pytest.fixture(autouse=True)
+def _restore_default_dtype():
+    default_dtype = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(default_dtype)
+
+
 # ---------------------------------------------------------------------------
 # Reference impl: legacy concat-and-slice path (mirrors _compute_mm_field_features)
 # ---------------------------------------------------------------------------
@@ -216,6 +223,69 @@ def test_pbc_equivalence_two_graphs():
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
     torch.testing.assert_close(new, legacy, rtol=1e-10, atol=1e-12)
+
+
+def test_pbc_source_target_respects_independent_batches():
+    """A source from graph 1 must not contribute to graph 0 targets."""
+    _set_dtype()
+
+    kspace_cutoff = 4.0
+    descriptor = _build_descriptor(
+        density_max_l=0,
+        feature_max_l=1,
+        feature_widths=[1.0],
+        kspace_cutoff=kspace_cutoff,
+    )
+
+    src_positions = torch.tensor(
+        [
+            [0.1, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+        ]
+    )
+    tgt_positions = torch.tensor([[0.3, 0.0, 0.0]])
+    src_batch = torch.tensor([0, 1], dtype=torch.long)
+    tgt_batch = torch.tensor([0], dtype=torch.long)
+    src_feats = torch.tensor([[1.0], [1000.0]])
+
+    box = 8.0
+    cells = torch.eye(3).unsqueeze(0).expand(2, 3, 3).contiguous() * box
+    rcells = torch.inverse(cells)
+    volume = torch.det(cells)
+    pbc = torch.tensor([[True, True, True], [True, True, True]], dtype=torch.bool)
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        kspace_cutoff, cells, rcells
+    )
+
+    both_sources = _new_source_target(
+        descriptor,
+        k_vectors,
+        k_norm2,
+        k_vector_batch,
+        k0_mask,
+        src_positions,
+        src_batch,
+        src_feats,
+        tgt_positions,
+        tgt_batch,
+        volume,
+        pbc,
+    )
+    graph0_only = _new_source_target(
+        descriptor,
+        k_vectors,
+        k_norm2,
+        k_vector_batch,
+        k0_mask,
+        src_positions[:1],
+        src_batch[:1],
+        src_feats[:1],
+        tgt_positions,
+        tgt_batch,
+        volume,
+        pbc,
+    )
+    torch.testing.assert_close(both_sources, graph0_only, rtol=1e-10, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
