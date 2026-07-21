@@ -410,3 +410,66 @@ def test_pbc_gradients_match_concat_path():
     new.sum().backward()
     torch.testing.assert_close(src_positions_b.grad, grad_src_legacy, rtol=1e-10, atol=1e-12)
     torch.testing.assert_close(tgt_positions_b.grad, grad_tgt_legacy, rtol=1e-10, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Graphs holding targets but no sources.
+#
+# Splitting the source and target sets breaks an invariant the symmetric path
+# could rely on: there, every graph with a target necessarily had a source, so
+# sizing a per-graph reduction by the highest index present in `batch` was
+# always right. Here a graph can hold targets and no sources at all, and the
+# reductions must still produce a (zero) row for it.
+# ---------------------------------------------------------------------------
+
+
+def test_slab_correction_no_leak_into_sourceless_graph():
+    """A target in a graph with no sources must feel no slab correction.
+
+    Sizing the dipole by `src_batch` alone yields one row for a two-graph batch,
+    which then broadcasts graph 0's dipole onto graph 1 — silently, with no error.
+    """
+    from graph_longrange.slabs import slab_dipole_correction_node_fields_source_target
+
+    node_fields = slab_dipole_correction_node_fields_source_target(
+        source_feats=torch.tensor([[3.0]]),
+        src_positions=torch.tensor([[0.0, 0.0, 2.0]]),
+        src_batch=torch.tensor([0]),          # every source in graph 0
+        tgt_positions=torch.tensor([[0.0, 0.0, 4.0]]),
+        tgt_batch=torch.tensor([1]),          # the target is in graph 1
+        volumes=torch.tensor([10.0, 20.0]),
+    )
+    torch.testing.assert_close(node_fields, torch.zeros_like(node_fields))
+
+
+def test_corrective_potential_handles_sourceless_trailing_graph():
+    """The highest-indexed graph having no sources must not raise."""
+    from graph_longrange.slabs import CorrectivePotentialBlock
+
+    block = CorrectivePotentialBlock(density_max_l=0)
+    node_fields = block.forward_source_target(
+        charge_coefficients=torch.tensor([[3.0]]),
+        src_positions=torch.tensor([[0.0, 0.0, 2.0]]),
+        src_batch=torch.tensor([0]),
+        tgt_positions=torch.tensor([[0.0, 0.0, 4.0], [0.0, 0.0, 5.0]]),
+        tgt_batch=torch.tensor([0, 1]),       # graph 1 has targets, no sources
+        volumes=torch.tensor([10.0, 20.0]),
+    )
+    assert node_fields.shape == (2, 4)
+    assert torch.isfinite(node_fields).all()
+
+
+def test_corrective_potential_with_no_sources_at_all():
+    """Zero sources is a legitimate input and must give a zero correction."""
+    from graph_longrange.slabs import CorrectivePotentialBlock
+
+    block = CorrectivePotentialBlock(density_max_l=0)
+    node_fields = block.forward_source_target(
+        charge_coefficients=torch.zeros((0, 1)),
+        src_positions=torch.zeros((0, 3)),
+        src_batch=torch.zeros(0, dtype=torch.long),
+        tgt_positions=torch.tensor([[0.0, 0.0, 4.0], [0.0, 0.0, 5.0]]),
+        tgt_batch=torch.tensor([0, 1]),
+        volumes=torch.tensor([10.0, 20.0]),
+    )
+    torch.testing.assert_close(node_fields, torch.zeros_like(node_fields))

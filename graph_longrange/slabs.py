@@ -1,5 +1,6 @@
 # specifically for electrocatalysis, certain charge compensation schemes and dipole corrections are needed
-import torch 
+import torch
+from typing import Optional
 from mace.tools.scatter import scatter_sum, scatter_mean
 from scipy.constants import pi
 from .utils import FIELD_CONSTANT, CUBIC_MADELUNG
@@ -36,10 +37,21 @@ def _is_batch1(batch: torch.Tensor) -> bool:
 
 
 def _get_total_dipole_z(
-    source_feats: torch.Tensor, node_positions: torch.Tensor, batch: torch.Tensor
+    source_feats: torch.Tensor,
+    node_positions: torch.Tensor,
+    batch: torch.Tensor,
+    n_graphs: Optional[int] = None,
 ) -> torch.Tensor:
+    """Per-graph total z-dipole of the given charges.
+
+    ``n_graphs`` has to be supplied whenever ``batch`` may not reach every graph.
+    That is the ordinary situation in the source-target setting, where a graph
+    can hold targets but no sources and the result still needs a (zero) row for
+    it.  Left as ``None`` the count is inferred from ``batch``, which is correct
+    when the sources cover every graph, as they always do when source == target.
+    """
     charges = source_feats[:, 0]
-    if _is_batch1(batch):
+    if _is_batch1(batch) and (n_graphs is None or n_graphs == 1):
         total_dipole_z = (node_positions[:, 2] * charges).sum().unsqueeze(0)
         if source_feats.shape[-1] > 1:
             local_dipoles = source_feats[:, 1:4]
@@ -47,11 +59,13 @@ def _get_total_dipole_z(
         return total_dipole_z
 
     total_dipole_z = scatter_sum(
-        src=node_positions[:, 2] * charges, index=batch, dim=0
+        src=node_positions[:, 2] * charges, index=batch, dim=0, dim_size=n_graphs
     )
     if source_feats.shape[-1] > 1:
         local_dipoles = source_feats[:, 1:4]
-        total_dipole_p = scatter_sum(src=local_dipoles, index=batch, dim=0)
+        total_dipole_p = scatter_sum(
+            src=local_dipoles, index=batch, dim=0, dim_size=n_graphs
+        )
         total_dipole_z = total_dipole_z + total_dipole_p[:, 1]
     return total_dipole_z
 
@@ -111,7 +125,9 @@ def slab_dipole_correction_node_fields_source_target(
     volumes: torch.Tensor,
 ):
     """Slab dipole correction: per-graph z-dipole from sources, field at targets."""
-    total_dipole_z = _get_total_dipole_z(source_feats, src_positions, src_batch)
+    total_dipole_z = _get_total_dipole_z(
+        source_feats, src_positions, src_batch, n_graphs=volumes.shape[0]
+    )
     A = FIELD_CONSTANT / (4 * pi)
     total_field_z = A * 4 * pi * total_dipole_z / volumes
     spread_total_field_z = torch.index_select(total_field_z, 0, tgt_batch)
@@ -222,20 +238,33 @@ class CorrectivePotentialBlock(torch.nn.Module):
         avoids the wasteful concat-and-slice pattern in MM→QM embedding.
         """
         # SOURCE side: per-graph (charge, dipole, quadrupole) from charge_coefficients.
-        total_charge = scatter_sum(src=charge_coefficients[:, 0], index=src_batch, dim=-1)
+        # Every reduction is sized by the number of graphs rather than by the
+        # highest index present in src_batch: a graph may hold targets but no
+        # sources, and it still needs a (zero) row so the target-side
+        # index_select below can address it.
+        n_graphs = volumes.shape[0]
+        total_charge = scatter_sum(
+            src=charge_coefficients[:, 0], index=src_batch, dim=-1, dim_size=n_graphs
+        )
         q_r_src = src_positions * charge_coefficients[:, 0].unsqueeze(-1)
-        total_dipole = scatter_sum(src=q_r_src, index=src_batch, dim=0)
+        total_dipole = scatter_sum(
+            src=q_r_src, index=src_batch, dim=0, dim_size=n_graphs
+        )
         r_squared_src = torch.sum(torch.square(src_positions), dim=-1)
         q_rr = r_squared_src * charge_coefficients[:, 0]
-        quadrupole = scatter_sum(src=q_rr, index=src_batch, dim=0)
+        quadrupole = scatter_sum(
+            src=q_rr, index=src_batch, dim=0, dim_size=n_graphs
+        )
 
         if self.density_max_l > 0:
             local_dipoles_cartesian = charge_coefficients[..., [3, 1, 2]]
             total_dipole = total_dipole + scatter_sum(
-                src=local_dipoles_cartesian, index=src_batch, dim=-2
+                src=local_dipoles_cartesian, index=src_batch, dim=-2, dim_size=n_graphs
             )
             p_dot_r = torch.einsum("bi,bi->b", src_positions, local_dipoles_cartesian)
-            quadrupole = quadrupole + 2 * scatter_sum(src=p_dot_r, index=src_batch, dim=0)
+            quadrupole = quadrupole + 2 * scatter_sum(
+                src=p_dot_r, index=src_batch, dim=0, dim_size=n_graphs
+            )
 
         # TARGET side: spread per-graph quantities to tgt_batch and evaluate field at tgt_positions.
         spread_dipoles = torch.index_select(total_dipole, 0, tgt_batch)

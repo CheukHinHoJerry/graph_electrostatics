@@ -5,6 +5,7 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
+import math
 from typing import List, Optional
 
 import torch
@@ -926,7 +927,11 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             sines=cache["sines_tgt"],
             k_factor_proj=cache["k_factor_proj"],
         )
-        features_flat = features_si.reshape(features_si.size(0), -1)
+        # State the trailing dimension rather than inferring it with -1: with zero
+        # targets the tensor holds no elements and -1 cannot be resolved.
+        features_flat = features_si.reshape(
+            features_si.size(0), math.prod(features_si.shape[1:])
+        )
         features_flat = self._permute_output_channels(features_flat)
 
         correction_mode = cache.get("correction_mode", CORRECTION_MODE_MIXED)
