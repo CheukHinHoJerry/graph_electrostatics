@@ -344,19 +344,26 @@ class DisplacedGTOExternalFieldBlock(torch.nn.Module):
         self,
         batch,  # [n_node]
         positions,
-        field,  # [n_graph, 4]
+        field,  # [n_graph, 4] normally; [n_node, 4] when per_atom=True
+        per_atom: bool = False,
     ):
         # field contains [V, E_x, E_y, E_z]
         assert field.dim() == 2
 
-        node_fields = torch.index_select(field, 0, batch)  # [n_nodes, 4]
-        potential = node_fields[:, 0].clone()
+        # ensure the convention is the same for now
+        # clarify whether we need external potential in the future
+        if per_atom:
+            # Field already evaluated at each atom position; no gauge transform.
+            node_fields = field.clone()
+        else:
+            node_fields = torch.index_select(field, 0, batch)  # [n_nodes, 4]
+            # Gauge transform: V_node = V_graph + E . r_node
+            potential_from_displacement = torch.einsum(
+                "bi,bi->b", positions, node_fields[:, 1:].clone()
+            )
+            node_fields[:, 0] = node_fields[:, 0] + potential_from_displacement
 
-        potential_from_displacement = torch.einsum(
-            "bi,bi->b", positions, node_fields[:, 1:].clone()
-        )
-        node_fields[:, 0] += potential_from_displacement
-
+        # Reorder [V, Ex, Ey, Ez] → [V, Ez, Ex, Ey] (e3nn convention)
         node_fields = node_fields[:, [0, 3, 1, 2]]
         projections = torch.einsum("pf,nf->np", self.matrix, node_fields)
 
