@@ -473,3 +473,39 @@ def test_corrective_potential_with_no_sources_at_all():
         volumes=torch.tensor([10.0, 20.0]),
     )
     torch.testing.assert_close(node_fields, torch.zeros_like(node_fields))
+
+
+def test_kspace_zero_targets_returns_empty_features():
+    """No targets is a legitimate input and must give an empty feature tensor.
+
+    The k-space path flattens with reshape, and inferring the trailing dimension
+    with -1 cannot work when the tensor has no elements to infer from.
+    """
+    _set_dtype()
+    torch.manual_seed(0)
+
+    kspace_cutoff = 4.0
+    descriptor = _build_descriptor(
+        density_max_l=0,
+        feature_max_l=0,
+        feature_widths=[0.8, 1.6],
+        kspace_cutoff=kspace_cutoff,
+    )
+
+    n_src = 4
+    src_positions = torch.randn(n_src, 3) * 2.0
+    src_batch = torch.zeros(n_src, dtype=torch.long)
+    src_feats = torch.randn(n_src, 1)
+    tgt_positions = torch.zeros((0, 3))
+    tgt_batch = torch.zeros(0, dtype=torch.long)
+
+    cell, rcell, volume, pbc = _make_pbc_geometry()
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        kspace_cutoff, cell, rcell
+    )
+
+    features = _new_source_target(
+        descriptor, k_vectors, k_norm2, k_vector_batch, k0_mask,
+        src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
+    )
+    assert features.shape[0] == 0
