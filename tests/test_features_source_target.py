@@ -1,15 +1,19 @@
 """Equivalence tests for the source-target descriptor API.
 
-The new `forward_source_target` path on `GTOElectrostaticFeatures` (and the
+The `forward_source_target` path on `GTOElectrostaticFeatures` (and the
 underlying `RealSpaceFiniteDifferenceElectrostaticFeatures`,
 `NonPeriodicFeatureCorrections`, `CorrectivePotentialBlock`,
 `slab_dipole_correction_node_fields_source_target`) must produce the same
-field features at target nodes as the legacy concat-and-slice approach when
-the QM (target-only) source coefficients are zero — that is, the case
-exercised by `_compute_mm_field_features` in `mace/mace/modules/extensions.py`.
+field features at target nodes as concatenating both node sets, running the
+symmetric path, and slicing out the target rows -- with the target source
+coefficients set to zero.
 
-Adding zero rows to a batched matmul / scatter is exact in IEEE float, so
-equivalence is expected at float64 round-off (allclose @ 1e-12).
+Adding zero rows to a batched matmul / scatter is exact in IEEE float, and the
+two paths are measured bit-identical on this build. The tolerances below are a
+few ULP at float64 rather than exact equality only to absorb BLAS blocking
+differences across platforms: the concatenated path multiplies a larger matrix
+than the source-target path, so a different blocking could legitimately differ
+in the last bit.
 """
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ import torch
 torch.serialization.add_safe_globals([slice])
 
 import pytest
+
+from scipy.constants import pi
 
 from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
@@ -115,7 +121,7 @@ def _set_dtype():
 
 def _make_pbc_geometry(box: float = 8.0):
     cell = torch.eye(3).unsqueeze(0) * box
-    rcell = torch.inverse(cell)
+    rcell = 2 * pi * torch.linalg.inv(cell).transpose(-1, -2)
     volume = torch.det(cell)
     pbc = torch.tensor([[True, True, True]], dtype=torch.bool)
     return cell, rcell, volume, pbc
@@ -124,7 +130,7 @@ def _make_pbc_geometry(box: float = 8.0):
 def _make_nonpbc_geometry(box: float = 30.0):
     # Use a large pseudo-cell for the molecule-correction code path.
     cell = torch.eye(3).unsqueeze(0) * box
-    rcell = torch.inverse(cell)
+    rcell = 2 * pi * torch.linalg.inv(cell).transpose(-1, -2)
     volume = torch.det(cell)
     pbc = torch.tensor([[False, False, False]], dtype=torch.bool)
     return cell, rcell, volume, pbc
@@ -137,9 +143,8 @@ def _build_descriptor(
     kspace_cutoff,
     pbc_handling="auto",
 ):
-    # `auto` reproduces the runtime pbc dispatch these tests were originally
-    # written against; individual tests pin a concrete handling where the point
-    # is to exercise one branch.
+    # `auto` dispatches on pbc at precompute time; individual tests pin a
+    # concrete handling where the point is to exercise one branch.
     return GTOElectrostaticFeatures(
         density_max_l=density_max_l,
         density_smearing_width=1.0,
@@ -190,7 +195,7 @@ def test_pbc_equivalence_single_graph(density_max_l, feature_max_l):
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
     assert legacy.shape == new.shape
-    torch.testing.assert_close(new, legacy, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(new, legacy, rtol=1e-13, atol=1e-15)
 
 
 def test_pbc_equivalence_two_graphs():
@@ -212,7 +217,7 @@ def test_pbc_equivalence_two_graphs():
 
     box = 8.0
     cells = torch.eye(3).unsqueeze(0).expand(2, 3, 3).contiguous() * box
-    rcells = torch.inverse(cells)
+    rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
     volume = torch.det(cells)
     pbc = torch.tensor([[True, True, True], [True, True, True]], dtype=torch.bool)
 
@@ -228,7 +233,7 @@ def test_pbc_equivalence_two_graphs():
         descriptor, k_vectors, k_norm2, k_vector_batch, k0_mask,
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
-    torch.testing.assert_close(new, legacy, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(new, legacy, rtol=1e-13, atol=1e-15)
 
 
 def test_pbc_source_target_respects_independent_batches():
@@ -256,7 +261,7 @@ def test_pbc_source_target_respects_independent_batches():
 
     box = 8.0
     cells = torch.eye(3).unsqueeze(0).expand(2, 3, 3).contiguous() * box
-    rcells = torch.inverse(cells)
+    rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
     volume = torch.det(cells)
     pbc = torch.tensor([[True, True, True], [True, True, True]], dtype=torch.bool)
     k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
@@ -291,7 +296,7 @@ def test_pbc_source_target_respects_independent_batches():
         volume,
         pbc,
     )
-    torch.testing.assert_close(both_sources, graph0_only, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(both_sources, graph0_only, rtol=1e-13, atol=1e-15)
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +339,7 @@ def test_nonpbc_equivalence_single_graph(density_max_l, feature_max_l):
         descriptor, k_vectors, k_norm2, k_vector_batch, k0_mask,
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
-    torch.testing.assert_close(new, legacy, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(new, legacy, rtol=1e-13, atol=1e-15)
 
 
 @pytest.mark.parametrize(
@@ -351,10 +356,10 @@ def test_nonpbc_equivalence_single_graph(density_max_l, feature_max_l):
 def test_each_pbc_handling_matches_concat_path(pbc_handling, periodic):
     """Every construction-time pbc_handling agrees with the concatenated path.
 
-    This replaces the old `force_pbc_evaluator` test: on develop the evaluator is
-    chosen when the class is built, so "force the PBC evaluator on a molecule" is
-    now simply `pbc_handling="molecule_in_box"`. Parametrising over all six modes
-    covers the dispatch table the source-target path adds.
+    The evaluator is bound in __init__, so each branch is exercised by building
+    the descriptor with that pbc_handling. Covers the whole dispatch table the
+    source-target path adds, including running the periodic evaluator on an
+    aperiodic system via `molecule_in_box`.
     """
     _set_dtype()
     torch.manual_seed(3)
@@ -391,7 +396,7 @@ def test_each_pbc_handling_matches_concat_path(pbc_handling, periodic):
         descriptor, k_vectors, k_norm2, k_vector_batch, k0_mask,
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
-    torch.testing.assert_close(new, legacy, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(new, legacy, rtol=1e-13, atol=1e-15)
 
 
 def test_source_target_cache_is_not_interchangeable_with_symmetric():
@@ -477,8 +482,8 @@ def test_pbc_gradients_match_concat_path():
         src_positions_b, src_batch, src_feats, tgt_positions_b, tgt_batch, volume, pbc,
     )
     new.sum().backward()
-    torch.testing.assert_close(src_positions_b.grad, grad_src_legacy, rtol=1e-10, atol=1e-12)
-    torch.testing.assert_close(tgt_positions_b.grad, grad_tgt_legacy, rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(src_positions_b.grad, grad_src_legacy, rtol=1e-13, atol=1e-15)
+    torch.testing.assert_close(tgt_positions_b.grad, grad_tgt_legacy, rtol=1e-13, atol=1e-15)
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +501,9 @@ def test_slab_correction_no_leak_into_sourceless_graph():
     """A target in a graph with no sources must feel no slab correction.
 
     Sizing the dipole by `src_batch` alone yields one row for a two-graph batch,
-    which then broadcasts graph 0's dipole onto graph 1 — silently, with no error.
+    which then broadcasts graph 0's dipole onto graph 1 -- silently, with no error.
     """
+    _set_dtype()
     from graph_longrange.slabs import slab_dipole_correction_node_fields_source_target
 
     node_fields = slab_dipole_correction_node_fields_source_target(
@@ -513,6 +519,7 @@ def test_slab_correction_no_leak_into_sourceless_graph():
 
 def test_corrective_potential_handles_sourceless_trailing_graph():
     """The highest-indexed graph having no sources must not raise."""
+    _set_dtype()
     from graph_longrange.slabs import CorrectivePotentialBlock
 
     block = CorrectivePotentialBlock(density_max_l=0)
@@ -526,10 +533,13 @@ def test_corrective_potential_handles_sourceless_trailing_graph():
     )
     assert node_fields.shape == (2, 4)
     assert torch.isfinite(node_fields).all()
+    # graph 1 holds no sources, so its target must feel exactly nothing
+    torch.testing.assert_close(node_fields[1], torch.zeros_like(node_fields[1]))
 
 
 def test_corrective_potential_with_no_sources_at_all():
     """Zero sources is a legitimate input and must give a zero correction."""
+    _set_dtype()
     from graph_longrange.slabs import CorrectivePotentialBlock
 
     block = CorrectivePotentialBlock(density_max_l=0)
@@ -578,3 +588,54 @@ def test_kspace_zero_targets_returns_empty_features():
         src_positions, src_batch, src_feats, tgt_positions, tgt_batch, volume, pbc,
     )
     assert features.shape[0] == 0
+
+
+@pytest.mark.parametrize(
+    "pbc_handling", ["pbc", "slab", "molecule_in_box", "mixed_periodic", "auto", "realspace"]
+)
+def test_accepts_three_dimensional_source_feats(pbc_handling):
+    """[n_src, 1, m_dim] must work in every mode, not only the real-space one.
+
+    The QM/MM caller passes `source_feats.unsqueeze(-2)`. Previously only the
+    real-space branch squeezed it; the periodic branches fed the 3-D tensor
+    straight into a matmul and raised, so the whole periodic source-target path
+    was unusable from the very caller it was written for.
+    """
+    _set_dtype()
+    torch.manual_seed(7)
+
+    kspace_cutoff = 4.0
+    descriptor = _build_descriptor(
+        density_max_l=1, feature_max_l=1,
+        feature_widths=[1.0], kspace_cutoff=kspace_cutoff,
+        pbc_handling=pbc_handling,
+    )
+    periodic = pbc_handling in ("pbc", "slab", "auto")
+    if periodic:
+        cell, rcell, volume, pbc = _make_pbc_geometry(box=8.0)
+        if pbc_handling == "slab":
+            pbc = torch.tensor([[True, True, False]], dtype=torch.bool)
+    else:
+        cell, rcell, volume, pbc = _make_nonpbc_geometry(box=20.0)
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        kspace_cutoff, cell, rcell
+    )
+
+    n_src, n_tgt = 5, 3
+    src_positions = torch.randn(n_src, 3)
+    tgt_positions = torch.randn(n_tgt, 3) + 0.5
+    src_batch = torch.zeros(n_src, dtype=torch.long)
+    tgt_batch = torch.zeros(n_tgt, dtype=torch.long)
+    src_feats = torch.randn(n_src, 4)
+
+    common = dict(
+        k_vectors=k_vectors, k_norm2=k_norm2, k_vector_batch=k_vector_batch,
+        k0_mask=k0_mask, src_positions=src_positions, src_batch=src_batch,
+        tgt_positions=tgt_positions, tgt_batch=tgt_batch, volume=volume, pbc=pbc,
+    )
+    flat = descriptor.forward_source_target(source_feats=src_feats, **common)
+    nested = descriptor.forward_source_target(
+        source_feats=src_feats.unsqueeze(-2), **common
+    )
+    assert flat.shape == nested.shape
+    torch.testing.assert_close(nested, flat, rtol=0.0, atol=0.0)

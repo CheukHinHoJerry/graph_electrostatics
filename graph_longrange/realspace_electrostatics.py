@@ -17,16 +17,21 @@ def batch_bipartite_pairs(
 
     Sources and targets live in disjoint node sets, so no self-exclusion is
     needed. Edge order is per-graph, then row-major (sender-major) within each
-    graph — this matches the order produced by the symmetric primitive when
-    restricted to MM→QM pairs, which keeps scatter sums bit-equivalent to the
-    legacy concat path under zero-coefficient padding.
+    graph -- matching the order the symmetric primitive produces when restricted
+    to source->target pairs. On CPU that makes the scatter sums bit-identical to
+    the concatenated path under zero-coefficient padding; on CUDA `scatter_add_`
+    is not order-deterministic, so only round-off agreement is guaranteed there.
+
+    Cost: the full dense n_src x n_tgt product per graph, with no distance
+    cutoff. Cheaper than the symmetric (n_src + n_tgt)^2 it replaces, but still
+    quadratic -- a large aperiodic MM environment will dominate memory.
 
     Args:
         src_batch: [N_src] graph ID per source node.
         tgt_batch: [N_tgt] graph ID per target node.
 
     Returns:
-        edge_index: [2, E] — row 0 = source index, row 1 = target index.
+        edge_index: [2, E] -- row 0 = source index, row 1 = target index.
     """
     src_batch = src_batch.long()
     tgt_batch = tgt_batch.long()
@@ -284,11 +289,11 @@ def charges_features_from_bipartite_graph(
     charges,                # [N_src]
     src_positions,          # [N_src, 3]
     tgt_positions,          # [N_tgt, 3]
-    edge_index,             # [2, E] — row 0 in src space, row 1 in tgt space
+    edge_index,             # [2, E] -- row 0 in src space, row 1 in tgt space
     n_targets,
     total_width_factors,    # [1, n_radial]
 ):
-    """Bipartite analogue of charges_features_from_graph for MM→QM fields."""
+    """Bipartite analogue of charges_features_from_graph for MM->QM fields."""
     sender, receiver = edge_index
     R_ij = src_positions[sender] - tgt_positions[receiver]
     d_ij = torch.norm(R_ij, dim=-1, keepdim=True)
@@ -482,7 +487,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
 
         return features, self_interaction_terms, None
 
-    def call_st_density_0_feats_0(
+    def call_source_target_density_0_feats_0(
         self,
         source_feats: torch.Tensor,   # [N_src, m_dim]
         src_positions: torch.Tensor,
@@ -501,7 +506,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         )
         return self.l0_factors * feats
 
-    def call_st_density_1_feats_1(
+    def call_source_target_density_1_feats_1(
         self,
         source_feats: torch.Tensor,   # [N_src, m_dim]
         src_positions: torch.Tensor,
@@ -509,7 +514,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         tgt_positions: torch.Tensor,
         tgt_batch: torch.Tensor,
     ) -> torch.Tensor:
-        # Source 4× duplication encodes source dipoles as displaced charges.
+        # Source 4x duplication encodes source dipoles as displaced charges.
         ext_src_positions = src_positions.repeat_interleave(4, dim=0)
         ext_src_positions[1::4] += self.x
         ext_src_positions[2::4] += self.y
@@ -523,7 +528,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             src_charges[1::4] + src_charges[2::4] + src_charges[3::4]
         )
 
-        # Target 4× duplication encodes the receive-side l=1 finite-difference basis.
+        # Target 4x duplication encodes the receive-side l=1 finite-difference basis.
         ext_tgt_positions = tgt_positions.repeat_interleave(4, dim=0)
         ext_tgt_positions[1::4] += self.x
         ext_tgt_positions[2::4] += self.y
@@ -567,11 +572,11 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         tgt_positions: torch.Tensor,
         tgt_batch: torch.Tensor,
     ) -> torch.Tensor:
-        """Source–target field features at tgt_positions from sources at src_positions.
+        """Source-target field features at tgt_positions from sources at src_positions.
 
         Precondition: source and target node sets are disjoint. The block does
         not subtract a self-interaction term, so colocated source/target rows
-        will produce wrong answers. Documented; not enforced (O(N²) check).
+        will produce wrong answers. Documented; not enforced (O(N^2) check).
         """
         if source_feats.dim() == 3:
             source_feats_2d = source_feats.squeeze(-2)
@@ -579,11 +584,11 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             source_feats_2d = source_feats
 
         if self.density_max_l == 0 and self.projection_max_l == 0:
-            return self.call_st_density_0_feats_0(
+            return self.call_source_target_density_0_feats_0(
                 source_feats_2d, src_positions, src_batch, tgt_positions, tgt_batch
             )
         if self.density_max_l == 1 and self.projection_max_l == 0:
-            all_feats = self.call_st_density_1_feats_1(
+            all_feats = self.call_source_target_density_1_feats_1(
                 source_feats_2d, src_positions, src_batch, tgt_positions, tgt_batch
             )
             return all_feats[:, : self.num_radial]
@@ -595,9 +600,9 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
                 device=source_feats_2d.device,
             )
             padded[:, 0] = source_feats_2d[:, 0]
-            return self.call_st_density_1_feats_1(
+            return self.call_source_target_density_1_feats_1(
                 padded, src_positions, src_batch, tgt_positions, tgt_batch
             )
-        return self.call_st_density_1_feats_1(
+        return self.call_source_target_density_1_feats_1(
             source_feats_2d, src_positions, src_batch, tgt_positions, tgt_batch
         )

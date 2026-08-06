@@ -238,9 +238,9 @@ class CorrectivePotentialBlock(torch.nn.Module):
         """Source-target form of forward(): per-graph multipoles from sources,
         corrective field evaluated at target positions.
 
-        Bit-equivalent to forward() when src_positions/src_batch == positions/batch
-        and tgt_positions/tgt_batch are the same. Splitting the sum/eval stages
-        avoids the wasteful concat-and-slice pattern in MM→QM embedding.
+        Reduces to forward() when the source and target node sets are the same.
+        Splitting the sum and evaluation stages avoids the concat-and-slice
+        pattern in MM->QM embedding.
         """
         # SOURCE side: per-graph (charge, dipole, quadrupole) from charge_coefficients.
         # Every reduction is sized by the number of graphs rather than by the
