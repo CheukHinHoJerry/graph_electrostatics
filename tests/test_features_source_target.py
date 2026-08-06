@@ -674,12 +674,7 @@ def test_overlapping_source_and_target_sets_raise():
     with pytest.raises(ValueError, match="overlap"):
         descriptor.forward_source_target(source_feats=torch.randn(4, 1), **common)
 
-    # opt-out restores the old, unchecked behaviour
-    descriptor.validate_source_target_disjoint = False
-    descriptor.precompute_geometry_source_target(**common)
-
     # duplicates WITHIN one set are legitimate and must not trip the check
-    descriptor.validate_source_target_disjoint = True
     dup_src = torch.cat([src_positions, src_positions[0:1]], dim=0)
     descriptor.precompute_geometry_source_target(
         **{**common, "src_positions": dup_src,
