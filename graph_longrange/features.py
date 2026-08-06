@@ -15,6 +15,7 @@ from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeat
 from .slabs import (
     CorrectivePotentialBlock,
     slab_dipole_correction_node_fields,
+    slab_dipole_correction_node_fields_source_target,
     _get_total_dipole_z,
 )
 from .utils import FIELD_CONSTANT
@@ -230,6 +231,101 @@ class NonPeriodicFeatureCorrections(torch.nn.Module):
             node_fields=node_fields,
         )
 
+    # --- source-target corrections ------------------------------------------
+    # The masks and the displaced-interaction projection are over TARGET rows:
+    # a correction is a field felt by a target, sourced by the source set. The
+    # per-graph reductions inside are sized by ``volumes`` rather than by the
+    # sources present, because a graph may hold targets and no sources at all.
+
+    @staticmethod
+    def _as_lm(source_feats: torch.Tensor) -> torch.Tensor:
+        return source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
+
+    def slab_source_target(
+        self,
+        source_feats: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volumes: torch.Tensor,
+    ) -> torch.Tensor:
+        node_fields = slab_dipole_correction_node_fields_source_target(
+            source_feats=self._as_lm(source_feats),
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        return self.displaced_interactions(
+            batch=tgt_batch,
+            positions=tgt_positions,
+            node_fields=node_fields,
+        )
+
+    def molecule_in_box_source_target(
+        self,
+        source_feats: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volumes: torch.Tensor,
+    ) -> torch.Tensor:
+        node_fields = self.self_field.forward_source_target(
+            charge_coefficients=self._as_lm(source_feats),
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        return self.displaced_interactions(
+            batch=tgt_batch,
+            positions=tgt_positions,
+            node_fields=node_fields,
+        )
+
+    def mixed_periodic_source_target(
+        self,
+        source_feats: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volumes: torch.Tensor,
+        correction_node_masks: dict,
+    ) -> torch.Tensor:
+        source_feats_lm = self._as_lm(source_feats)
+        node_fields_molecule = self.self_field.forward_source_target(
+            charge_coefficients=source_feats_lm,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        node_fields_slab = slab_dipole_correction_node_fields_source_target(
+            source_feats=source_feats_lm,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volumes=volumes,
+        )
+        is_molecule = correction_node_masks["is_molecule_node"]
+        is_slab = correction_node_masks["is_slab_node"]
+        node_fields = torch.zeros_like(node_fields_molecule)
+        node_fields[is_molecule] = node_fields_molecule[is_molecule]
+        node_fields[is_slab] = node_fields_slab[is_slab]
+
+        return self.displaced_interactions(
+            batch=tgt_batch,
+            positions=tgt_positions,
+            node_fields=node_fields,
+        )
+
     def forward(
         self,
         source_feats: torch.Tensor,
@@ -341,6 +437,12 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self.static_quantities = None
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
+        self._precompute_geometry_st_impl = (
+            self._select_precompute_geometry_source_target_impl()
+        )
+        self._forward_dynamic_st_impl = (
+            self._select_forward_dynamic_source_target_impl()
+        )
 
     @staticmethod
     def _build_output_permutation(max_l: int, n_radial: int) -> torch.Tensor:
@@ -385,10 +487,46 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             return self._forward_dynamic_auto
         raise ValueError(f"Unsupported pbc_handling: {self.pbc_handling}")
 
+    def _select_precompute_geometry_source_target_impl(self) -> Callable:
+        if self.pbc_handling == "realspace":
+            return self._precompute_geometry_source_target_realspace
+        if self.pbc_handling == "pbc":
+            return self._precompute_geometry_source_target_pbc
+        if self.pbc_handling == "slab":
+            return self._precompute_geometry_source_target_slab
+        if self.pbc_handling == "molecule_in_box":
+            return self._precompute_geometry_source_target_molecule_in_box
+        if self.pbc_handling == "mixed_periodic":
+            return self._precompute_geometry_source_target_mixed_periodic
+        if self.pbc_handling == "auto":
+            return self._precompute_geometry_source_target_auto
+        raise ValueError(f"Unsupported pbc_handling: {self.pbc_handling}")
+
+    def _select_forward_dynamic_source_target_impl(self) -> Callable:
+        if self.pbc_handling == "realspace":
+            return self._forward_dynamic_source_target_realspace
+        if self.pbc_handling == "pbc":
+            return self._forward_dynamic_source_target_pbc
+        if self.pbc_handling == "slab":
+            return self._forward_dynamic_source_target_slab
+        if self.pbc_handling == "molecule_in_box":
+            return self._forward_dynamic_source_target_molecule_in_box
+        if self.pbc_handling == "mixed_periodic":
+            return self._forward_dynamic_source_target_mixed_periodic
+        if self.pbc_handling == "auto":
+            return self._forward_dynamic_source_target_auto
+        raise ValueError(f"Unsupported pbc_handling: {self.pbc_handling}")
+
     def set_pbc_handling(self, pbc_handling: FeaturePBCHandling) -> None:
         self.pbc_handling = pbc_handling
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
+        self._precompute_geometry_st_impl = (
+            self._select_precompute_geometry_source_target_impl()
+        )
+        self._forward_dynamic_st_impl = (
+            self._select_forward_dynamic_source_target_impl()
+        )
 
     def forward(
         self,
@@ -790,3 +928,312 @@ class GTOElectrostaticFeatures(torch.nn.Module):
                 cache=cache,
             )
         raise ValueError(f"Unsupported cache mode for auto features: {cache_mode!r}.")
+
+    # --- source-target API ----------------------------------------------------
+    # The symmetric path computes the field a set of smeared charges makes at
+    # ITSELF. This computes the field one set (the sources) makes at a DIFFERENT
+    # set of positions (the targets). The motivating case is QM/MM electrostatic
+    # embedding, where MM point charges polarise an ML region: routing that
+    # through the symmetric path means concatenating both sets, computing
+    # everything, and slicing out the cross terms -- which also pays for the
+    # source-source interactions a classical force field already owns.
+    #
+    # Precondition: the source and target node sets are DISJOINT. No
+    # self-interaction term is subtracted, so colocated source/target rows give
+    # wrong answers. Documented, not enforced -- the check is O(N*M).
+    #
+    # Cache modes are prefixed "st_" so a symmetric cache can never be fed to a
+    # source-target forward, or vice versa.
+
+    def forward_source_target(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        source_feats: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> torch.Tensor:
+        cache = self._precompute_geometry_st_impl(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volume=volume,
+            pbc=pbc,
+        )
+        self.static_quantities = cache
+        return self._forward_dynamic_st_impl(source_feats=source_feats, cache=cache)
+
+    def precompute_geometry_source_target(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> dict:
+        cache = self._precompute_geometry_st_impl(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            src_positions=src_positions,
+            src_batch=src_batch,
+            tgt_positions=tgt_positions,
+            tgt_batch=tgt_batch,
+            volume=volume,
+            pbc=pbc,
+        )
+        self.static_quantities = cache
+        return cache
+
+    def forward_dynamic_source_target(
+        self,
+        cache: dict,
+        source_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._forward_dynamic_st_impl(source_feats=source_feats, cache=cache)
+
+    def _precompute_geometry_source_target_realspace(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> dict:
+        return {
+            "mode": "st_realspace",
+            "src_positions": src_positions,
+            "src_batch": src_batch,
+            "tgt_positions": tgt_positions,
+            "tgt_batch": tgt_batch,
+        }
+
+    def _precompute_geometry_source_target_periodic_common(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> dict:
+        inner_src = torch.matmul(k_vectors, src_positions.t())
+        mask_src_f = (k_vector_batch[:, None] == src_batch[None, :]).to(
+            dtype=inner_src.dtype
+        )
+        cosines_src = torch.cos(inner_src) * mask_src_f
+        sines_src = torch.sin(inner_src) * mask_src_f
+
+        inner_tgt = torch.matmul(k_vectors, tgt_positions.t())
+        mask_tgt_f = (k_vector_batch[:, None] == tgt_batch[None, :]).to(
+            dtype=inner_tgt.dtype
+        )
+        cosines_tgt = torch.cos(inner_tgt) * mask_tgt_f
+        sines_tgt = torch.sin(inner_tgt) * mask_tgt_f
+
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
+
+        volume_per_k = volume.reshape(-1)[k_vector_batch]
+        k_factor_coulomb = compute_coulomb_factor(k_norm2, k0_mask)
+        k_factor_proj = torch.ones_like(k_norm2)
+        k_factor_proj[k0_mask > 0.0] = 0.5
+
+        return {
+            "mode": "st_pbc",
+            "k_norm2": k_norm2,
+            "k_vector_batch": k_vector_batch,
+            "k0_mask": k0_mask,
+            "volume_per_k": volume_per_k,
+            "k_factor_coulomb": k_factor_coulomb,
+            "k_factor_proj": k_factor_proj,
+            "volumes": volume.reshape(-1),
+            "src_positions": src_positions,
+            "src_batch": src_batch,
+            "tgt_positions": tgt_positions,
+            "tgt_batch": tgt_batch,
+            "pbc": pbc,
+            "cosines_src": cosines_src,
+            "sines_src": sines_src,
+            "cosines_tgt": cosines_tgt,
+            "sines_tgt": sines_tgt,
+            "density_basis_fs": density_basis_fs,
+            "feature_basis_fs": feature_basis_fs,
+        }
+
+    def _precompute_geometry_source_target_pbc(self, **kwargs) -> dict:
+        return self._precompute_geometry_source_target_periodic_common(**kwargs)
+
+    def _precompute_geometry_source_target_slab(self, **kwargs) -> dict:
+        return self._precompute_geometry_source_target_periodic_common(**kwargs)
+
+    def _precompute_geometry_source_target_molecule_in_box(self, **kwargs) -> dict:
+        return self._precompute_geometry_source_target_periodic_common(**kwargs)
+
+    def _precompute_geometry_source_target_mixed_periodic(self, **kwargs) -> dict:
+        cache = self._precompute_geometry_source_target_periodic_common(**kwargs)
+        pbc_bool = kwargs["pbc"].to(dtype=torch.bool)
+        is_molecule_graph = (~pbc_bool).all(dim=1)
+        is_slab_graph = pbc_bool[:, 0] & pbc_bool[:, 1] & (~pbc_bool[:, 2])
+        # masks are over TARGET rows: the correction is a field felt by a target
+        tgt_batch = kwargs["tgt_batch"]
+        cache["correction_node_masks"] = {
+            "is_molecule_node": torch.index_select(is_molecule_graph, 0, tgt_batch),
+            "is_slab_node": torch.index_select(is_slab_graph, 0, tgt_batch),
+        }
+        return cache
+
+    def _precompute_geometry_source_target_auto(self, **kwargs) -> dict:
+        if torch.any(kwargs["pbc"]):
+            return self._precompute_geometry_source_target_mixed_periodic(**kwargs)
+        return self._precompute_geometry_source_target_realspace(**kwargs)
+
+    def _forward_dynamic_source_target_realspace(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        self._require_cache_mode(cache, "st_realspace")
+        return self.realspace_features.forward_source_target(
+            source_feats=source_feats,
+            src_positions=cache["src_positions"],
+            src_batch=cache["src_batch"],
+            tgt_positions=cache["tgt_positions"],
+            tgt_batch=cache["tgt_batch"],
+        )
+
+    def _forward_dynamic_source_target_periodic_common(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        self._require_cache_mode(cache, "st_pbc")
+        density = assemble_fourier_series_batch(
+            source_feats=source_feats,
+            cosines=cache["cosines_src"],
+            sines=cache["sines_src"],
+            density_basis_fs=cache["density_basis_fs"],
+            volume_per_k=cache["volume_per_k"],
+        )
+        potential = apply_coulomb_kernel_batch(
+            density=density,
+            k_factor_coulomb=cache["k_factor_coulomb"],
+        )
+        features_si = project_to_features_batch(
+            potential=potential,
+            feature_basis_fs=cache["feature_basis_fs"],
+            cosines=cache["cosines_tgt"],
+            sines=cache["sines_tgt"],
+            k_factor_proj=cache["k_factor_proj"],
+        )
+        # State the trailing dimension rather than inferring it with -1: with
+        # zero targets the tensor holds no elements and -1 cannot be resolved.
+        features_flat = features_si.reshape(
+            features_si.size(0), features_si.size(1) * features_si.size(2)
+        )
+        # No self-interaction subtraction: sources and targets are disjoint.
+        return self._permute_output_channels(features_flat)
+
+    def _forward_dynamic_source_target_pbc(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        return self._forward_dynamic_source_target_periodic_common(
+            source_feats=source_feats, cache=cache
+        )
+
+    def _forward_dynamic_source_target_slab(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        features_flat = self._forward_dynamic_source_target_periodic_common(
+            source_feats=source_feats, cache=cache
+        )
+        correction_terms = self.non_periodic_correction_terms.slab_source_target(
+            source_feats=source_feats,
+            src_positions=cache["src_positions"],
+            src_batch=cache["src_batch"],
+            tgt_positions=cache["tgt_positions"],
+            tgt_batch=cache["tgt_batch"],
+            volumes=cache["volumes"],
+        )
+        return features_flat + correction_terms
+
+    def _forward_dynamic_source_target_molecule_in_box(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        features_flat = self._forward_dynamic_source_target_periodic_common(
+            source_feats=source_feats, cache=cache
+        )
+        correction_terms = (
+            self.non_periodic_correction_terms.molecule_in_box_source_target(
+                source_feats=source_feats,
+                src_positions=cache["src_positions"],
+                src_batch=cache["src_batch"],
+                tgt_positions=cache["tgt_positions"],
+                tgt_batch=cache["tgt_batch"],
+                volumes=cache["volumes"],
+            )
+        )
+        return features_flat + correction_terms
+
+    def _forward_dynamic_source_target_mixed_periodic(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        features_flat = self._forward_dynamic_source_target_periodic_common(
+            source_feats=source_feats, cache=cache
+        )
+        correction_node_masks = cache.get("correction_node_masks")
+        if correction_node_masks is None:
+            raise ValueError(
+                "mixed_periodic source-target features require a cache with "
+                "correction_node_masks."
+            )
+        correction_terms = (
+            self.non_periodic_correction_terms.mixed_periodic_source_target(
+                source_feats=source_feats,
+                src_positions=cache["src_positions"],
+                src_batch=cache["src_batch"],
+                tgt_positions=cache["tgt_positions"],
+                tgt_batch=cache["tgt_batch"],
+                volumes=cache["volumes"],
+                correction_node_masks=correction_node_masks,
+            )
+        )
+        return features_flat + correction_terms
+
+    def _forward_dynamic_source_target_auto(
+        self, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        cache_mode = cache.get("mode")
+        if cache_mode == "st_realspace":
+            return self._forward_dynamic_source_target_realspace(
+                source_feats=source_feats, cache=cache
+            )
+        if cache_mode == "st_pbc":
+            return self._forward_dynamic_source_target_mixed_periodic(
+                source_feats=source_feats, cache=cache
+            )
+        raise ValueError(
+            f"Unsupported cache mode for auto source-target features: {cache_mode!r}."
+        )
