@@ -374,6 +374,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         quadrupole_feature_corrections: bool = False,
         integral_normalization: str = "receiver",
         pbc_handling: FeaturePBCHandling = "mixed_periodic",
+        validate_source_target_disjoint: bool = True,
     ):
         super().__init__()
         self.density_basis = GTOBasis(
@@ -391,6 +392,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self.kspace_cutoff = kspace_cutoff
         self.include_self_interaction = include_self_interaction
         self.pbc_handling = pbc_handling
+        self.validate_source_target_disjoint = validate_source_target_disjoint
 
         self.self_interaction_terms = GTOSelfInteractionBlock(
             l_source=density_max_l,
@@ -923,6 +925,40 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         """Accept [n_src, m_dim] and the [n_src, 1, m_dim] QM/MM callers pass."""
         return source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
 
+    def _check_source_target_disjoint(
+        self, src_positions: torch.Tensor, tgt_positions: torch.Tensor
+    ) -> None:
+        """Raise if a source position coincides exactly with a target position.
+
+        Projects each node onto one scalar key and screens with a 1-D `isin`;
+        identical rows always give identical keys, and the few hits are then
+        confirmed by exact comparison, so a collision cannot raise a false alarm.
+        Detects exact coincidence only.
+        """
+        if src_positions.shape[0] == 0 or tgt_positions.shape[0] == 0:
+            return
+        weights = torch.tensor(
+            [1.0, 1.4142135623730951, 2.23606797749979],
+            dtype=src_positions.dtype, device=src_positions.device,
+        )
+        src_keys = src_positions.detach() @ weights
+        tgt_keys = tgt_positions.detach() @ weights
+        if src_keys.numel() * tgt_keys.numel() <= 1 << 24:
+            # few targets (the QM/MM case): a broadcast compare beats isin's sort
+            matched = (tgt_keys[:, None] == src_keys[None, :]).any(dim=1)
+        else:
+            matched = torch.isin(tgt_keys, src_keys)
+        hits = matched.nonzero(as_tuple=True)[0]
+        for j in hits.tolist():
+            if (src_positions == tgt_positions[j]).all(dim=1).any():
+                raise ValueError(
+                    "source and target node sets overlap: the source-target "
+                    "path subtracts no self-interaction term, so a coincident "
+                    "source would silently corrupt that target's features. Pass "
+                    "disjoint sets, or set "
+                    "validate_source_target_disjoint=False."
+                )
+
     def forward_source_target(
         self,
         k_vectors: torch.Tensor,
@@ -953,6 +989,8 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         Args:
             source_feats: [n_src, m_dim], or [n_src, 1, m_dim].
         """
+        if self.validate_source_target_disjoint:
+            self._check_source_target_disjoint(src_positions, tgt_positions)
         cache = self._precompute_geometry_source_target_impl(
             k_vectors=k_vectors,
             k_norm2=k_norm2,
@@ -983,6 +1021,8 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         volume: torch.Tensor,
         pbc: torch.Tensor,
     ) -> dict:
+        if self.validate_source_target_disjoint:
+            self._check_source_target_disjoint(src_positions, tgt_positions)
         cache = self._precompute_geometry_source_target_impl(
             k_vectors=k_vectors,
             k_norm2=k_norm2,

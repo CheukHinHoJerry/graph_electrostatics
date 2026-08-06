@@ -639,3 +639,50 @@ def test_accepts_three_dimensional_source_feats(pbc_handling):
     )
     assert flat.shape == nested.shape
     torch.testing.assert_close(nested, flat, rtol=0.0, atol=0.0)
+
+
+def test_overlapping_source_and_target_sets_raise():
+    """A source sitting exactly on a target must raise, not silently corrupt.
+
+    No self-interaction term is subtracted on this path, so an atom present in
+    both sets acts on itself. Measured effect when it slips through: ~+190% on
+    the affected target under PBC.
+    """
+    _set_dtype()
+    torch.manual_seed(21)
+
+    kspace_cutoff = 4.0
+    descriptor = _build_descriptor(
+        density_max_l=0, feature_max_l=0,
+        feature_widths=[1.0], kspace_cutoff=kspace_cutoff, pbc_handling="pbc",
+    )
+    cell, rcell, volume, pbc = _make_pbc_geometry(box=8.0)
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        kspace_cutoff, cell, rcell
+    )
+    src_positions = torch.randn(4, 3)
+    tgt_positions = torch.cat([torch.randn(2, 3), src_positions[1:2]], dim=0)
+    common = dict(
+        k_vectors=k_vectors, k_norm2=k_norm2, k_vector_batch=k_vector_batch,
+        k0_mask=k0_mask, src_positions=src_positions,
+        src_batch=torch.zeros(4, dtype=torch.long),
+        tgt_positions=tgt_positions, tgt_batch=torch.zeros(3, dtype=torch.long),
+        volume=volume, pbc=pbc,
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        descriptor.precompute_geometry_source_target(**common)
+    with pytest.raises(ValueError, match="overlap"):
+        descriptor.forward_source_target(source_feats=torch.randn(4, 1), **common)
+
+    # opt-out restores the old, unchecked behaviour
+    descriptor.validate_source_target_disjoint = False
+    descriptor.precompute_geometry_source_target(**common)
+
+    # duplicates WITHIN one set are legitimate and must not trip the check
+    descriptor.validate_source_target_disjoint = True
+    dup_src = torch.cat([src_positions, src_positions[0:1]], dim=0)
+    descriptor.precompute_geometry_source_target(
+        **{**common, "src_positions": dup_src,
+           "src_batch": torch.zeros(5, dtype=torch.long),
+           "tgt_positions": torch.randn(3, 3)}
+    )
