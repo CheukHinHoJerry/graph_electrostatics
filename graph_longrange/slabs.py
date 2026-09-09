@@ -190,7 +190,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
 
         node_fields = torch.zeros(
             (positions.shape[0], 4),
-            dtype=torch.get_default_dtype(),
+            dtype=positions.dtype,
             device=positions.device,
         )
 
@@ -280,7 +280,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
 
         node_fields = torch.zeros(
             (tgt_positions.shape[0], 4),
-            dtype=torch.get_default_dtype(),
+            dtype=tgt_positions.dtype,
             device=tgt_positions.device,
         )
 

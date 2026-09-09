@@ -554,6 +554,70 @@ def test_corrective_potential_with_no_sources_at_all():
     torch.testing.assert_close(node_fields, torch.zeros_like(node_fields))
 
 
+@pytest.mark.parametrize("source_target", [False, True])
+def test_corrective_potential_preserves_input_dtype(source_target):
+    """Output allocation must follow the model/input dtype, not global state."""
+    _set_dtype()
+    from graph_longrange.slabs import CorrectivePotentialBlock
+
+    block = CorrectivePotentialBlock(density_max_l=0)
+    coefficients = torch.tensor([[0.3], [-0.2]], dtype=torch.float64)
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [0.7, -0.2, 0.4]], dtype=torch.float64
+    )
+    batch = torch.zeros(2, dtype=torch.long)
+    volumes = torch.tensor([512.0], dtype=torch.float64)
+    torch.set_default_dtype(torch.float32)
+
+    if source_target:
+        output = block.forward_source_target(
+            coefficients, positions, batch, positions + 1.0, batch, volumes
+        )
+    else:
+        output = block(coefficients, positions, volumes, batch)
+
+    assert output.dtype == torch.float64
+
+
+@pytest.mark.parametrize("source_target", [False, True])
+def test_realspace_features_preserve_input_dtype(source_target):
+    """Finite-difference feature assembly must not downcast float64 models."""
+    _set_dtype()
+    from graph_longrange.realspace_electrostatics import (
+        RealSpaceFiniteDifferenceElectrostaticFeatures,
+    )
+
+    block = RealSpaceFiniteDifferenceElectrostaticFeatures(
+        density_max_l=0,
+        density_smearing_width=0.7,
+        projection_max_l=0,
+        projection_smearing_widths=[1.0],
+    )
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.7, -0.2, 0.4]], dtype=torch.float64
+    )
+    batch = torch.zeros(2, dtype=torch.long)
+    features = torch.tensor([[0.3], [-0.2]], dtype=torch.float64)
+    torch.set_default_dtype(torch.float32)
+
+    if source_target:
+        output = block.forward_source_target(
+            source_feats=features[:1],
+            src_positions=positions[:1],
+            src_batch=batch[:1],
+            tgt_positions=positions[1:],
+            tgt_batch=batch[1:],
+        )
+    else:
+        output, _, _ = block(
+            source_feats=features,
+            node_positions=positions,
+            batch=batch,
+        )
+
+    assert output.dtype == torch.float64
+
+
 def test_kspace_zero_targets_returns_empty_features():
     """No targets is a legitimate input and must give an empty feature tensor.
 

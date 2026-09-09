@@ -433,7 +433,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         all_features = torch.zeros(
             batch.size(0),
             4 * self.num_radial,
-            dtype=torch.get_default_dtype(),
+            dtype=scalar_features.dtype,
             device=batch.device,
         )
 
@@ -549,7 +549,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         all_features = torch.zeros(
             n_tgt,
             4 * self.num_radial,
-            dtype=torch.get_default_dtype(),
+            dtype=tgt_positions.dtype,
             device=tgt_positions.device,
         )
         all_features[:, : self.num_radial] = self.l0_factors * scalar_features[0::4]
