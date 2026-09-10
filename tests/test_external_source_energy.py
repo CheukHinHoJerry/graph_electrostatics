@@ -28,6 +28,28 @@ def _float64():
     torch.set_default_dtype(previous)
 
 
+@pytest.mark.parametrize("mode", ["slab", "molecule_in_box", "mixed_periodic"])
+@pytest.mark.parametrize("occupied", [1, 2])
+@pytest.mark.parametrize("max_l", [0, 1])
+def test_corrections_leave_missing_graphs_empty(mode, occupied, max_l):
+    block = GTOElectrostaticCrossEnergy(max_l, 0.7, 4.0, pbc_handling=mode)
+    features = torch.full((occupied, (max_l + 1) ** 2), 0.3)
+    positions = torch.ones((occupied, 3), requires_grad=True)
+    volume = torch.tensor([720., 800., 900.])
+    pbc = torch.tensor([[True, True, False]] * 3)
+    actual = block._correction(features, positions, torch.arange(occupied), volume, pbc, mode, 3)
+    expected = torch.cat([
+        block._correction(features[i:i+1], positions[i:i+1], torch.zeros(1, dtype=torch.long),
+                          volume[i:i+1], pbc[i:i+1], mode, 1)
+        for i in range(occupied)
+    ] + [volume.new_zeros(3 - occupied)])
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual.sum(), positions, retain_graph=True)[0],
+        torch.autograd.grad(expected.sum(), positions)[0],
+    )
+
+
 def _geometry(pbc):
     cell = torch.diag(torch.tensor([8.0, 9.0, 10.0])).unsqueeze(0)
     rcell = 2 * pi * torch.linalg.inv(cell).transpose(-1, -2)
