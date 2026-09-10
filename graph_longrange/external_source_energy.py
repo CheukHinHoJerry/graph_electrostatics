@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import Literal, Union
+from typing import Literal, Optional, Union
 
 import torch
 from mace.tools.scatter import scatter_sum
@@ -468,3 +468,110 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
             mode,
             num_graphs,
         )
+
+
+class GTOElectrostaticExternalSourceEnergy(torch.nn.Module):
+    """Add a dynamic external-source cross term to a normal GTO energy block.
+
+    For an internal source set ``A`` and external set ``B``, this wrapper
+    returns
+
+    ``E(A) + E_cross(A, B) = E(A + B) - E(B)``.
+
+    External tensors use graph_longrange's ``multipoles`` normalization and
+    e3nn component ordering.  They are transient evaluation inputs rather than
+    model buffers or checkpoint state.
+    """
+
+    def __init__(
+        self,
+        base: GTOElectrostaticEnergy,
+        cross: Optional[GTOElectrostaticCrossEnergy] = None,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.cross = (
+            GTOElectrostaticCrossEnergy.from_energy(base)
+            if cross is None
+            else cross
+        )
+        self._external_feats: Optional[torch.Tensor] = None
+        self._external_positions: Optional[torch.Tensor] = None
+        self._external_batch: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_energy(
+        cls,
+        energy: GTOElectrostaticEnergy,
+        **cross_kwargs,
+    ) -> "GTOElectrostaticExternalSourceEnergy":
+        """Wrap ``energy`` and construct a cross block with matching bases."""
+        return cls(
+            base=energy,
+            cross=GTOElectrostaticCrossEnergy.from_energy(energy, **cross_kwargs),
+        )
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base, name)
+
+    def set_pbc_handling(self, pbc_handling: CrossPBCHandling) -> None:
+        self.base.set_pbc_handling(pbc_handling)
+        self.cross.set_pbc_handling(pbc_handling)
+
+    def set_external_sources(
+        self,
+        external_feats: Optional[torch.Tensor] = None,
+        external_positions: Optional[torch.Tensor] = None,
+        external_batch: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Set one evaluation's external sources, or clear them with all ``None``."""
+        values = (external_feats, external_positions, external_batch)
+        if all(value is None for value in values):
+            self.clear_external_sources()
+            return
+        if any(value is None for value in values):
+            raise ValueError(
+                "external_feats, external_positions and external_batch must "
+                "either all be provided or all be None."
+            )
+        self._external_feats = external_feats
+        self._external_positions = external_positions
+        self._external_batch = external_batch
+
+    def clear_external_sources(self) -> None:
+        self._external_feats = None
+        self._external_positions = None
+        self._external_batch = None
+
+    def forward(self, **kwargs) -> torch.Tensor:
+        """Return the native energy plus the current external cross energy."""
+        base_kwargs = dict(kwargs)
+        # Older host models may still pass this retired graph_longrange option.
+        base_kwargs.pop("force_pbc_evaluator", None)
+        energy = self.base(**base_kwargs)
+        if self._external_feats is None:
+            return energy
+        cross = self.cross(
+            k_vectors=base_kwargs["k_vectors"],
+            k_norm2=base_kwargs["k_norm2"],
+            k_vector_batch=base_kwargs["k_vector_batch"],
+            k0_mask=base_kwargs["k0_mask"],
+            source_feats=base_kwargs["source_feats"],
+            source_positions=base_kwargs["node_positions"],
+            source_batch=base_kwargs["batch"],
+            target_feats=self._external_feats,
+            target_positions=self._external_positions,
+            target_batch=self._external_batch,
+            volume=base_kwargs["volume"],
+            pbc=base_kwargs["pbc"],
+        )
+        return energy + cross
+
+
+__all__ = [
+    "GTOElectrostaticCrossEnergy",
+    "GTOElectrostaticExternalSourceEnergy",
+]

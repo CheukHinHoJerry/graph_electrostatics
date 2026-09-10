@@ -1,4 +1,4 @@
-# External-source cross energy
+# External electrostatic sources
 
 `GTOElectrostaticCrossEnergy` evaluates the electrostatic interaction between
 two disjoint sets of GTO multipoles.  It is intended for dynamic environments
@@ -45,3 +45,40 @@ energy_ab = cross(
 
 The two position tensors remain in the autograd graph, so differentiating this
 energy produces equal-and-opposite reaction forces on the two subsystems.
+
+## Drop-in energy and feature wrappers
+
+For host models that already call `GTOElectrostaticEnergy` and
+`GTOElectrostaticFeatures`, graph_longrange also provides wrappers that retain
+the same-set calculation and add a dynamic external contribution:
+
+```python
+from graph_longrange.external_source_energy import (
+    GTOElectrostaticExternalSourceEnergy,
+)
+from graph_longrange.external_source_features import (
+    GTOElectrostaticExternalSourceFeatures,
+)
+
+model.coulomb_energy = GTOElectrostaticExternalSourceEnergy.from_energy(
+    model.coulomb_energy
+)
+model.electric_potential_descriptor = (
+    GTOElectrostaticExternalSourceFeatures.from_features(
+        model.electric_potential_descriptor,
+        external_scale=0.5,  # two equal spin channels in PolarMACE
+    )
+)
+
+for block in (model.coulomb_energy, model.electric_potential_descriptor):
+    block.set_external_sources(
+        external_feats=environment_multipoles,
+        external_positions=environment_positions,
+        external_batch=environment_batch,
+    )
+```
+
+The energy wrapper returns `E(A) + E_cross(A, B)`, which is equal to
+`E(A + B) - E(B)`.  The feature wrapper returns the normal same-set features
+plus `external_scale` times the source-to-target field.  Adapters remain
+responsible for clearing the transient external sources after each evaluation.

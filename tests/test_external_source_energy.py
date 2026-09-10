@@ -12,7 +12,10 @@ from scipy.constants import pi
 torch.serialization.add_safe_globals([slice])
 
 from graph_longrange.energy import GTOElectrostaticEnergy
-from graph_longrange.external_source_energy import GTOElectrostaticCrossEnergy
+from graph_longrange.external_source_energy import (
+    GTOElectrostaticCrossEnergy,
+    GTOElectrostaticExternalSourceEnergy,
+)
 from graph_longrange.kspace import compute_k_vectors_flat
 from graph_longrange.utils import FIELD_CONSTANT
 
@@ -207,3 +210,56 @@ def test_empty_external_set_returns_one_zero_per_graph():
         target_batch=torch.empty((0,), dtype=torch.long),
     )
     torch.testing.assert_close(actual, torch.zeros(1))
+
+
+def test_external_source_energy_wraps_base_plus_cross_and_can_be_cleared():
+    geometry = _geometry([False, False, False])
+    (
+        source_feats,
+        source_positions,
+        source_batch,
+        target_feats,
+        target_positions,
+        target_batch,
+    ) = _sets(1)
+    base = GTOElectrostaticEnergy(
+        density_max_l=1,
+        density_smearing_width=0.7,
+        kspace_cutoff=4.0,
+        include_self_interaction=False,
+        pbc_handling="realspace",
+    )
+    wrapped = GTOElectrostaticExternalSourceEnergy.from_energy(base)
+    base_kwargs = dict(
+        **geometry,
+        source_feats=source_feats,
+        node_positions=source_positions,
+        batch=source_batch,
+    )
+    base_energy = base(**base_kwargs)
+    cross_energy = wrapped.cross(
+        **geometry,
+        source_feats=source_feats,
+        source_positions=source_positions,
+        source_batch=source_batch,
+        target_feats=target_feats,
+        target_positions=target_positions,
+        target_batch=target_batch,
+    )
+
+    wrapped.set_external_sources(target_feats, target_positions, target_batch)
+    torch.testing.assert_close(wrapped(**base_kwargs), base_energy + cross_energy)
+
+    wrapped.clear_external_sources()
+    torch.testing.assert_close(wrapped(**base_kwargs), base_energy)
+
+
+def test_external_source_energy_validates_source_lifecycle_and_syncs_pbc_mode():
+    base = GTOElectrostaticEnergy(0, 0.7, 4.0, pbc_handling="realspace")
+    wrapped = GTOElectrostaticExternalSourceEnergy.from_energy(base)
+    with pytest.raises(ValueError, match="either all be provided or all be None"):
+        wrapped.set_external_sources(external_feats=torch.ones((1, 1)))
+
+    wrapped.set_pbc_handling("pbc")
+    assert wrapped.base.pbc_handling == "pbc"
+    assert wrapped.cross.pbc_handling == "pbc"
