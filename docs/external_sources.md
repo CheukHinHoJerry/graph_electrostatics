@@ -1,5 +1,13 @@
 # External electrostatic sources
 
+Source-target field features live in `external_source_features.py`; damped
+real-space helpers live in `external_source_realspace.py`. The ordinary
+`GTOElectrostaticFeatures` block retains its same-set API. Wrap an existing
+block with `GTOElectrostaticExternalSourceFeatures.from_features(base)` to use
+`forward_source_target`, or the split `precompute_geometry_source_target` and
+`forward_dynamic_source_target` calls. The wrapper reuses the existing basis
+objects and parameters without rebuilding them.
+
 `GTOElectrostaticCrossEnergy` evaluates the electrostatic interaction between
 two disjoint sets of GTO multipoles.  It is intended for dynamic environments
 such as electrostatic ML/MM embedding, while remaining independent of MACE and

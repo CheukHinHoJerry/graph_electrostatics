@@ -64,7 +64,8 @@ def test_external_source_features_add_scaled_source_target_field():
     base = _base()
     base_cache = base.precompute_geometry(**geometry)
     internal = base.forward_dynamic(base_cache, internal_feats)
-    external_cache = base.precompute_geometry_source_target(
+    source_target = GTOElectrostaticExternalSourceFeatures.from_features(base)
+    external_cache = source_target.precompute_geometry_source_target(
         k_vectors=geometry["k_vectors"],
         k_norm2=geometry["k_norm2"],
         k_vector_batch=geometry["k_vector_batch"],
@@ -76,7 +77,7 @@ def test_external_source_features_add_scaled_source_target_field():
         volume=geometry["volume"],
         pbc=geometry["pbc"],
     )
-    external = base.forward_dynamic_source_target(external_cache, external_feats)
+    external = source_target.forward_dynamic_source_target(external_cache, external_feats)
 
     wrapped = GTOElectrostaticExternalSourceFeatures.from_features(
         base, external_scale=0.5
@@ -96,6 +97,10 @@ def test_external_source_features_clear_and_validate_lifecycle():
     geometry, internal_feats, external_feats, _, _ = _inputs()
     base = _base()
     wrapped = GTOElectrostaticExternalSourceFeatures.from_features(base)
+    assert wrapped.base is base
+    assert wrapped.density_basis is base.density_basis
+    assert wrapped.realspace_features is base.realspace_features
+    assert not hasattr(base, "forward_source_target")
     with pytest.raises(ValueError, match="either all be provided or all be None"):
         wrapped.set_external_sources(external_feats=external_feats)
 

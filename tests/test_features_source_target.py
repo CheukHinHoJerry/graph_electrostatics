@@ -1,6 +1,6 @@
 """Equivalence tests for the source-target descriptor API.
 
-The `forward_source_target` path on `GTOElectrostaticFeatures` (and the
+The `forward_source_target` path on `GTOElectrostaticExternalSourceFeatures` (and the
 underlying `RealSpaceFiniteDifferenceElectrostaticFeatures`,
 `NonPeriodicFeatureCorrections`, `CorrectivePotentialBlock`,
 `slab_dipole_correction_node_fields_source_target`) must produce the same
@@ -145,7 +145,9 @@ def _build_descriptor(
 ):
     # `auto` dispatches on pbc at precompute time; individual tests pin a
     # concrete handling where the point is to exercise one branch.
-    return GTOElectrostaticFeatures(
+    from graph_longrange.external_source_features import GTOElectrostaticExternalSourceFeatures
+
+    return GTOElectrostaticExternalSourceFeatures(GTOElectrostaticFeatures(
         density_max_l=density_max_l,
         density_smearing_width=1.0,
         feature_max_l=feature_max_l,
@@ -153,7 +155,7 @@ def _build_descriptor(
         kspace_cutoff=kspace_cutoff,
         include_self_interaction=False,
         pbc_handling=pbc_handling,
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +603,9 @@ def test_realspace_features_preserve_input_dtype(source_target):
     torch.set_default_dtype(torch.float32)
 
     if source_target:
-        output = block.forward_source_target(
+        from graph_longrange.external_source_realspace import _ExternalSourceRealspace
+
+        output = _ExternalSourceRealspace(block).forward_source_target(
             source_feats=features[:1],
             src_positions=positions[:1],
             src_batch=batch[:1],
