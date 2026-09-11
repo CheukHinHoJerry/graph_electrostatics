@@ -190,11 +190,7 @@ class CorrectivePotentialBlock(torch.nn.Module):
         spread_volumes = torch.index_select(volumes, 0, batch)
         spread_total_quadrupole = torch.index_select(quadrupole, 0, batch)
 
-        node_fields = torch.zeros(
-            (positions.shape[0], 4),
-            dtype=positions.dtype,
-            device=positions.device,
-        )
+        node_fields = positions.new_zeros((positions.shape[0], 4))
 
         # L=0 piece has several terms
         Ls = torch.pow(volumes, 0.333333)
