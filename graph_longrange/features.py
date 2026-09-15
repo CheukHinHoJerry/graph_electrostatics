@@ -600,7 +600,8 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             volume=volume,
             pbc=pbc,
         )
-        pbc_bool = pbc.to(dtype=torch.bool)
+        pbc_bool = pbc.to(dtype=torch.bool).reshape(-1, 3)
+        pbc_bool = pbc_bool.expand(volume.reshape(-1).shape[0], -1)
         is_molecule_graph = (~pbc_bool).all(dim=1)
         is_slab_graph = pbc_bool[:, 0] & pbc_bool[:, 1] & (~pbc_bool[:, 2])
         cache["correction_node_masks"] = {
