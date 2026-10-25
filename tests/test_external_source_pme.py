@@ -397,3 +397,33 @@ def test_pme_missing_torchpme_raises_import_error(monkeypatch):
     system = _system(cells, [5], [2], 1)
     with pytest.raises(ImportError, match="torch-pme"):
         _features(pme, _geometry(cells, "pbc"), system, cell=cells)
+
+
+@pytest.mark.parametrize("scale", [1.01, 1.0 + 1e-4])
+def test_pme_rejects_slightly_mismatched_cell(scale):
+    cells = _cells()[:1]
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [10], [2], 1)
+    _, pme = _pair(0, 0, "pbc")
+    with pytest.raises(ValueError, match="integer combinations"):
+        _features(pme, geometry, system, cell=cells * scale)
+
+
+def test_pme_empty_sources_keep_autograd_path():
+    cells = _cells()[:1]
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [0], [3], 4)
+    grads = []
+    for method in ("direct", "pme"):
+        block = GTOElectrostaticExternalSourceFeatures.from_features(
+            _base(1, 1, "pbc"), kspace_method=method
+        )
+        feats = system["source_feats"].clone().requires_grad_()
+        features = _features(
+            block, geometry, dict(system, source_feats=feats),
+            cell=cells if method == "pme" else None,
+        )
+        assert features.requires_grad
+        (feats_grad,) = torch.autograd.grad(features.sum(), feats)
+        grads.append(feats_grad)
+    assert grads[0].shape == grads[1].shape == (0, 4)

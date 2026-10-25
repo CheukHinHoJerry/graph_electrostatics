@@ -88,16 +88,18 @@ def precompute_pme_source_geometry(
             continue
         cell_g = cell[g].to(dtype=src_positions.dtype)
         with torch.no_grad():
-            # Single-precision k-vectors can sit ~1e-2 off the lattice (TF32
-            # matmuls give that at |n| ~ 30); indices are a whole unit apart,
-            # so rounding is still exact and 0.25 still rejects a wrong cell.
+            # A cell off by a relative delta puts each index off by ~delta * |n|,
+            # so the relative residual measures the mismatch.  Single-precision
+            # k-vectors already sit ~4e-4 off relatively under TF32 matmuls.
             m_float = (
                 k_vectors[k_rows].detach().double()
                 @ cell_g.detach().double().t()
                 / (2 * pi)
             )
             m_int = torch.round(m_float)
-            if (m_float - m_int).abs().max() > 0.25:
+            relative_residual = (m_float - m_int).abs() / m_int.abs().clamp_min(1.0)
+            tolerance = 1e-6 if k_vectors.dtype == torch.float64 else 2e-3
+            if relative_residual.max() > tolerance:
                 raise ValueError(
                     "k_vectors are not integer combinations of 2*pi*inv(cell)^T: "
                     "pass the cell the k-vectors were generated from."
@@ -150,8 +152,11 @@ def pme_structure_factor(
     source's own graph.
     """
     m_dim = source_feats.size(-1)
-    coeff_cos = source_feats.new_zeros((n_k_total, m_dim))
-    coeff_sin = source_feats.new_zeros((n_k_total, m_dim))
+    # anchored to source_feats so an empty source set keeps an autograd path,
+    # as the direct matmul does
+    zero = 0.0 * source_feats.sum()
+    coeff_cos = source_feats.new_zeros((n_k_total, m_dim)) + zero
+    coeff_sin = source_feats.new_zeros((n_k_total, m_dim)) + zero
     for graph in pme_geometry:
         mesh = graph["interpolator"].points_to_mesh(source_feats[graph["src_rows"]])
         mesh_fs = torch.fft.fftn(mesh, dim=(-3, -2, -1))
