@@ -115,7 +115,9 @@ def _assert_close_scaled(actual, expected, rel):
 
 
 @pytest.mark.parametrize("pbc_handling", list(PBC_FLAGS))
-@pytest.mark.parametrize("density_max_l,feature_max_l", [(0, 0), (1, 1), (0, 1), (1, 0)])
+@pytest.mark.parametrize(
+    "density_max_l,feature_max_l", [(0, 0), (1, 1), (0, 1), (1, 0)]
+)
 def test_pme_matches_direct(pbc_handling, density_max_l, feature_max_l):
     cells = _cells()[:1]
     direct, pme = _pair(density_max_l, feature_max_l, pbc_handling)
@@ -155,7 +157,10 @@ def test_pme_gradients_match_direct():
         features = _features(block, geometry, inputs, cell=cell)
         (features ** 2).sum().backward()
         grads.append(
-            [inputs[key].grad for key in ("src_positions", "source_feats", "tgt_positions")]
+            [
+                inputs[key].grad
+                for key in ("src_positions", "source_feats", "tgt_positions")
+            ]
         )
     for actual, expected in zip(grads[1], grads[0]):
         _assert_close_scaled(actual, expected, rel=5e-4)
@@ -169,8 +174,10 @@ def test_pme_error_decreases_with_mesh_factor():
     _, fine = _pair(1, 1, "pbc", pme_mesh_factor=3.0)
 
     expected = _features(direct, geometry, system)
-    coarse_error = (_features(coarse, geometry, system, cell=cells) - expected).abs().max()
-    fine_error = (_features(fine, geometry, system, cell=cells) - expected).abs().max()
+    coarse_features = _features(coarse, geometry, system, cell=cells)
+    fine_features = _features(fine, geometry, system, cell=cells)
+    coarse_error = (coarse_features - expected).abs().max()
+    fine_error = (fine_features - expected).abs().max()
     assert fine_error < 0.1 * coarse_error
 
 
@@ -189,7 +196,9 @@ def test_pme_wrapper_uses_external_cell():
         system["source_feats"], system["src_positions"], system["src_batch"]
     )
 
-    direct = GTOElectrostaticExternalSourceFeatures.from_features(base, external_scale=0.5)
+    direct = GTOElectrostaticExternalSourceFeatures.from_features(
+        base, external_scale=0.5
+    )
     direct.set_external_sources(*external)
     pme = GTOElectrostaticExternalSourceFeatures.from_features(
         base, external_scale=0.5, kspace_method="pme"
@@ -243,7 +252,9 @@ def test_pme_split_api_reuses_geometry_for_new_source_feats():
         for key in ("src_positions", "src_batch", "tgt_positions", "tgt_batch")
     }
     direct_cache = direct.precompute_geometry_source_target(**geometry, **positions)
-    pme_cache = pme.precompute_geometry_source_target(**geometry, **positions, cell=cells)
+    pme_cache = pme.precompute_geometry_source_target(
+        **geometry, **positions, cell=cells
+    )
     assert "cosines_src" not in pme_cache and "sines_src" not in pme_cache
 
     for seed in (0, 1):
@@ -294,7 +305,9 @@ def test_pme_is_periodic_in_source_images():
     geometry = _geometry(cells, "pbc")
     system = _system(cells, [30], [4], 4, seed=23)
     shifts = torch.randint(-3, 4, (30, 3), generator=torch.Generator().manual_seed(0))
-    unwrapped = dict(system, src_positions=system["src_positions"] + shifts.double() @ cells[0])
+    unwrapped = dict(
+        system, src_positions=system["src_positions"] + shifts.double() @ cells[0]
+    )
 
     expected = _features(pme, geometry, system, cell=cells)
     actual = _features(pme, geometry, unwrapped, cell=cells)
@@ -337,7 +350,8 @@ def test_pme_broadcasts_single_cell_and_rejects_wrong_count():
     system = _system(cells, [20, 25], [3, 2], 1, seed=37)
 
     expected = _features(direct, geometry, system)
-    _assert_close_scaled(_features(pme, geometry, system, cell=cells[0]), expected, rel=5e-5)
+    actual = _features(pme, geometry, system, cell=cells[0])
+    _assert_close_scaled(actual, expected, rel=5e-5)
     with pytest.raises(ValueError, match="graphs"):
         _features(pme, geometry, system, cell=torch.cat([cells, cells[:1]]))
 
@@ -360,7 +374,9 @@ def test_pme_empty_source_and_target_sets():
 def test_pme_mixed_periodic_batch_with_slab_and_bulk_graphs():
     cells = _cells()
     rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
-    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(2.5, cells, rcells)
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+        2.5, cells, rcells
+    )
     geometry = {
         "k_vectors": k_vectors,
         "k_norm2": k_norm2,
@@ -427,3 +443,21 @@ def test_pme_empty_sources_keep_autograd_path():
         (feats_grad,) = torch.autograd.grad(features.sum(), feats)
         grads.append(feats_grad)
     assert grads[0].shape == grads[1].shape == (0, 4)
+
+
+def test_pme_float32_accepts_tf32_sized_kvector_noise_in_triclinic_cell():
+    torch.set_default_dtype(torch.float32)
+    cells = _cells()[:1] * 4.0
+    geometry = _geometry(cells, "pbc")
+    generator = torch.Generator().manual_seed(47)
+    # TF32 matmuls leave k ~5e-4 relatively off, mixed across components
+    noise = torch.randn(geometry["k_vectors"].shape, generator=generator)
+    noise = noise / noise.norm(dim=-1, keepdim=True)
+    k_norm = geometry["k_vectors"].norm(dim=-1, keepdim=True)
+    noisy = dict(geometry, k_vectors=geometry["k_vectors"] + 5e-4 * k_norm * noise)
+    system = _system(cells, [100], [4], 4, seed=53)
+    _, pme = _pair(1, 1, "pbc")
+
+    clean = _features(pme, geometry, system, cell=cells)
+    actual = _features(pme, noisy, system, cell=cells)
+    _assert_close_scaled(actual, clean, rel=5e-2)

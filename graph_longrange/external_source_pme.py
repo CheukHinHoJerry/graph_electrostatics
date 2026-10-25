@@ -27,7 +27,7 @@ from scipy.constants import pi
 
 try:
     from torchpme.lib import MeshInterpolator
-except ImportError:  # pragma: no cover - exercised only without torch-pme
+except ImportError:  # optional dependency, only needed for kspace_method="pme"
     MeshInterpolator = None
 
 
@@ -88,16 +88,19 @@ def precompute_pme_source_geometry(
             continue
         cell_g = cell[g].to(dtype=src_positions.dtype)
         with torch.no_grad():
-            # A cell off by a relative delta puts each index off by ~delta * |n|,
-            # so the relative residual measures the mismatch.  Single-precision
-            # k-vectors already sit ~4e-4 off relatively under TF32 matmuls.
+            # A cell off by a relative delta puts an index vector off by
+            # ~delta * max|n|, spread over all its components in a triclinic
+            # cell, so normalise each vector's residual by its largest index.
+            # Single-precision k-vectors already sit ~4e-4 off under TF32.
             m_float = (
                 k_vectors[k_rows].detach().double()
                 @ cell_g.detach().double().t()
                 / (2 * pi)
             )
             m_int = torch.round(m_float)
-            relative_residual = (m_float - m_int).abs() / m_int.abs().clamp_min(1.0)
+            relative_residual = (m_float - m_int).abs().amax(dim=-1) / (
+                m_int.abs().amax(dim=-1).clamp_min(1.0)
+            )
             tolerance = 1e-6 if k_vectors.dtype == torch.float64 else 2e-3
             if relative_residual.max() > tolerance:
                 raise ValueError(
@@ -126,7 +129,9 @@ def precompute_pme_source_geometry(
                 mesh_index[:, 0], mesh_index[:, 1], mesh_index[:, 2]
             ]
 
-        interpolator = MeshInterpolator(cell_g, ns_mesh, interpolation_nodes, method="P3M")
+        interpolator = MeshInterpolator(
+            cell_g, ns_mesh, interpolation_nodes, method="P3M"
+        )
         interpolator.compute_weights(src_positions[src_rows])
         graphs.append(
             {
