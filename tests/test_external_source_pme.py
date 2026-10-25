@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 from scipy.constants import pi
 
-pytest.importorskip("torchpme")
+needs_torchpme = pytest.mark.skipif(
+    importlib.util.find_spec("torchpme") is None, reason="torch-pme is not installed"
+)
 
 from graph_longrange.external_source_features import (
     GTOElectrostaticExternalSourceFeatures,
@@ -104,7 +108,7 @@ def _pair(density_max_l, feature_max_l, pbc_handling, **pme_kwargs):
     base = _base(density_max_l, feature_max_l, pbc_handling)
     direct = GTOElectrostaticExternalSourceFeatures.from_features(base)
     pme = GTOElectrostaticExternalSourceFeatures.from_features(
-        base, kspace_method="pme", **pme_kwargs
+        base, method="PME", **pme_kwargs
     )
     return direct, pme
 
@@ -118,6 +122,7 @@ def _assert_close_scaled(actual, expected, rel):
 @pytest.mark.parametrize(
     "density_max_l,feature_max_l", [(0, 0), (1, 1), (0, 1), (1, 0)]
 )
+@needs_torchpme
 def test_pme_matches_direct(pbc_handling, density_max_l, feature_max_l):
     cells = _cells()[:1]
     direct, pme = _pair(density_max_l, feature_max_l, pbc_handling)
@@ -129,6 +134,7 @@ def test_pme_matches_direct(pbc_handling, density_max_l, feature_max_l):
     _assert_close_scaled(actual, expected, rel=5e-5)
 
 
+@needs_torchpme
 def test_pme_batched_cells_and_graph_without_sources():
     cells = torch.cat([_cells(), _cells()[:1] * 1.1])
     direct, pme = _pair(1, 1, "mixed_periodic")
@@ -142,6 +148,7 @@ def test_pme_batched_cells_and_graph_without_sources():
     torch.testing.assert_close(actual[graph_1], expected[graph_1])
 
 
+@needs_torchpme
 def test_pme_gradients_match_direct():
     cells = _cells()[:1]
     direct, pme = _pair(1, 1, "pbc")
@@ -166,6 +173,7 @@ def test_pme_gradients_match_direct():
         _assert_close_scaled(actual, expected, rel=5e-4)
 
 
+@needs_torchpme
 def test_pme_error_decreases_with_mesh_factor():
     cells = _cells()[:1]
     geometry = _geometry(cells, "pbc")
@@ -181,6 +189,7 @@ def test_pme_error_decreases_with_mesh_factor():
     assert fine_error < 0.1 * coarse_error
 
 
+@needs_torchpme
 def test_pme_wrapper_uses_external_cell():
     cells = _cells()[:1]
     pbc_geometry = _geometry(cells, "pbc")
@@ -201,7 +210,7 @@ def test_pme_wrapper_uses_external_cell():
     )
     direct.set_external_sources(*external)
     pme = GTOElectrostaticExternalSourceFeatures.from_features(
-        base, external_scale=0.5, kspace_method="pme"
+        base, external_scale=0.5, method="PME"
     )
     pme.set_external_sources(*external, cell=cells)
 
@@ -213,12 +222,44 @@ def test_pme_wrapper_uses_external_cell():
     assert pme._external_cell is None
 
 
-def test_pme_validates_inputs():
-    with pytest.raises(ValueError, match="kspace_method"):
-        GTOElectrostaticExternalSourceFeatures.from_features(
-            _base(0, 0, "pbc"), kspace_method="ewald"
-        )
+@pytest.mark.parametrize("method", ["PME", "pme", "Pme"])
+def test_pme_method_name_is_case_insensitive(method):
+    block = GTOElectrostaticExternalSourceFeatures.from_features(
+        _base(0, 0, "pbc"), method=method
+    )
+    assert block.use_pme
+    assert block.pme_mesh_factor == 3.0 and block.pme_interpolation_nodes == 5
 
+
+@pytest.mark.parametrize("method", ["direct", None, "ewald", "pmee"])
+def test_other_methods_fall_back_to_direct(method):
+    cells = _cells()[:1]
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [20], [3], 4, seed=59)
+    base = _base(1, 1, "pbc")
+    reference = GTOElectrostaticExternalSourceFeatures.from_features(base)
+    block = GTOElectrostaticExternalSourceFeatures.from_features(base, method=method)
+    assert not block.use_pme
+
+    cache = block.precompute_geometry_source_target(
+        **geometry,
+        src_positions=system["src_positions"],
+        src_batch=system["src_batch"],
+        tgt_positions=system["tgt_positions"],
+        tgt_batch=system["tgt_batch"],
+        cell=cells,
+    )
+    assert "cosines_src" in cache and "pme_geometry" not in cache
+    torch.testing.assert_close(
+        _features(block, geometry, system, cell=cells),
+        _features(reference, geometry, system),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@needs_torchpme
+def test_pme_validates_inputs():
     cells = _cells()[:1]
     geometry = _geometry(cells, "pbc")
     system = _system(cells, [10], [2], 1)
@@ -229,6 +270,7 @@ def test_pme_validates_inputs():
         _features(pme, geometry, system, cell=cells * 1.37)
 
 
+@needs_torchpme
 def test_pme_float32_matches_direct():
     torch.set_default_dtype(torch.float32)
     cells = _cells()[:1] * 4.0  # larger |n| makes single-precision k rounding visible
@@ -242,6 +284,7 @@ def test_pme_float32_matches_direct():
     _assert_close_scaled(actual, expected, rel=1e-3)
 
 
+@needs_torchpme
 def test_pme_split_api_reuses_geometry_for_new_source_feats():
     cells = _cells()[:1]
     direct, pme = _pair(1, 1, "pbc")
@@ -264,6 +307,7 @@ def test_pme_split_api_reuses_geometry_for_new_source_feats():
         _assert_close_scaled(actual, expected, rel=5e-5)
 
 
+@needs_torchpme
 def test_pme_cell_gradient_matches_direct():
     system = _system(_cells()[:1], [40], [4], 4, seed=19)
     frac = {
@@ -278,7 +322,7 @@ def test_pme_cell_gradient_matches_direct():
             2.5, cells, rcells
         )
         block = GTOElectrostaticExternalSourceFeatures.from_features(
-            _base(1, 1, "pbc"), kspace_method=method
+            _base(1, 1, "pbc"), method=method
         )
         features = block.forward_source_target(
             k_vectors=k_vectors,
@@ -299,6 +343,7 @@ def test_pme_cell_gradient_matches_direct():
     _assert_close_scaled(grads[1], grads[0], rel=5e-4)
 
 
+@needs_torchpme
 def test_pme_is_periodic_in_source_images():
     cells = _cells()[:1]
     _, pme = _pair(1, 1, "pbc")
@@ -314,6 +359,7 @@ def test_pme_is_periodic_in_source_images():
     _assert_close_scaled(actual, expected, rel=1e-10)
 
 
+@needs_torchpme
 def test_pme_is_translation_invariant():
     cells = _cells()[:1]
     direct, pme = _pair(1, 1, "pbc")
@@ -331,6 +377,7 @@ def test_pme_is_translation_invariant():
     _assert_close_scaled(actual, expected, rel=5e-5)
 
 
+@needs_torchpme
 @pytest.mark.parametrize("nodes,rel", [(3, 2e-3), (4, 5e-4), (5, 5e-5)])
 def test_pme_interpolation_orders(nodes, rel):
     cells = _cells()[:1]
@@ -343,6 +390,7 @@ def test_pme_interpolation_orders(nodes, rel):
     _assert_close_scaled(actual, expected, rel=rel)
 
 
+@needs_torchpme
 def test_pme_broadcasts_single_cell_and_rejects_wrong_count():
     cells = torch.cat([_cells()[:1], _cells()[:1]])
     direct, pme = _pair(0, 0, "pbc")
@@ -356,6 +404,7 @@ def test_pme_broadcasts_single_cell_and_rejects_wrong_count():
         _features(pme, geometry, system, cell=torch.cat([cells, cells[:1]]))
 
 
+@needs_torchpme
 def test_pme_empty_source_and_target_sets():
     cells = _cells()[:1]
     direct, pme = _pair(1, 1, "pbc")
@@ -371,6 +420,7 @@ def test_pme_empty_source_and_target_sets():
     assert actual.shape == _features(direct, geometry, no_targets).shape == (0, 8)
 
 
+@needs_torchpme
 def test_pme_mixed_periodic_batch_with_slab_and_bulk_graphs():
     cells = _cells()
     rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
@@ -393,6 +443,7 @@ def test_pme_mixed_periodic_batch_with_slab_and_bulk_graphs():
         _assert_close_scaled(actual, expected, rel=5e-5)
 
 
+@needs_torchpme
 def test_pme_auto_without_periodicity_needs_no_cell():
     cells = _cells()[:1]
     direct, pme = _pair(1, 1, "auto")
@@ -415,6 +466,7 @@ def test_pme_missing_torchpme_raises_import_error(monkeypatch):
         _features(pme, _geometry(cells, "pbc"), system, cell=cells)
 
 
+@needs_torchpme
 @pytest.mark.parametrize("scale", [1.01, 1.0 + 1e-4])
 def test_pme_rejects_slightly_mismatched_cell(scale):
     cells = _cells()[:1]
@@ -425,6 +477,7 @@ def test_pme_rejects_slightly_mismatched_cell(scale):
         _features(pme, geometry, system, cell=cells * scale)
 
 
+@needs_torchpme
 def test_pme_empty_sources_keep_autograd_path():
     cells = _cells()[:1]
     geometry = _geometry(cells, "pbc")
@@ -432,7 +485,7 @@ def test_pme_empty_sources_keep_autograd_path():
     grads = []
     for method in ("direct", "pme"):
         block = GTOElectrostaticExternalSourceFeatures.from_features(
-            _base(1, 1, "pbc"), kspace_method=method
+            _base(1, 1, "pbc"), method=method
         )
         feats = system["source_feats"].clone().requires_grad_()
         features = _features(
@@ -445,6 +498,7 @@ def test_pme_empty_sources_keep_autograd_path():
     assert grads[0].shape == grads[1].shape == (0, 4)
 
 
+@needs_torchpme
 def test_pme_float32_accepts_tf32_sized_kvector_noise_in_triclinic_cell():
     torch.set_default_dtype(torch.float32)
     cells = _cells()[:1] * 4.0

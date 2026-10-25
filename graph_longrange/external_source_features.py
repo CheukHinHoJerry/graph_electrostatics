@@ -19,7 +19,10 @@ from .features import (
 )
 from .slabs import slab_dipole_correction_node_fields_source_target
 from .external_source_realspace import _ExternalSourceRealspace
-from .external_source_pme import precompute_pme_source_geometry, pme_structure_factor
+from .external_source_pme import (
+    PME_DEFAULT_INTERPOLATION_NODES, PME_DEFAULT_MESH_FACTOR,
+    precompute_pme_source_geometry, pme_structure_factor,
+)
 
 
 class _ExternalSourceCorrections:
@@ -129,12 +132,13 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
     across several channels.  Its default is one; PolarMACE, for example, uses
     one half for each of its alpha and beta channels.
 
-    ``kspace_method`` selects how the periodic source side is evaluated.
-    ``"direct"`` sums over sources exactly with dense ``[n_k, n_src]`` tables;
-    ``"pme"`` spreads the sources onto a mesh and uses an FFT instead (see
-    :mod:`graph_longrange.external_source_pme`), which needs the cell and
-    torch-pme but scales to large external environments.  The target side is
-    always projected exactly.
+    ``method`` selects how the periodic source side is evaluated.  ``"PME"``
+    (any case) spreads the sources onto a mesh and uses an FFT (see
+    :mod:`graph_longrange.external_source_pme`), which needs the cell and the
+    optional torch-pme package but scales to large external environments;
+    ``pme_interpolation_nodes`` and ``pme_mesh_factor`` tune its accuracy.  Any
+    other value keeps the original direct sum over dense ``[n_k, n_src]``
+    tables.  The target side is always projected exactly.
     """
 
     _EXTERNAL_FIELD_CACHE_KEY = "_graph_longrange_external_field"
@@ -143,20 +147,17 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         self,
         base: GTOElectrostaticFeatures,
         external_scale: float = 1.0,
-        kspace_method: str = "direct",
-        pme_interpolation_nodes: int = 5,
-        pme_mesh_factor: float = 3.0,
+        method: Optional[str] = "direct",
+        pme_interpolation_nodes: int = PME_DEFAULT_INTERPOLATION_NODES,
+        pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
     ) -> None:
         super().__init__()
-        if kspace_method not in ("direct", "pme"):
-            raise ValueError(
-                f"kspace_method must be 'direct' or 'pme', got {kspace_method!r}."
-            )
-        if pme_mesh_factor < 1.0:
-            raise ValueError("pme_mesh_factor must be at least 1.0.")
         self.base = base
         self.external_scale = float(external_scale)
-        self.kspace_method = kspace_method
+        self.method = method
+        self.use_pme = isinstance(method, str) and method.upper() == "PME"
+        if self.use_pme and pme_mesh_factor < 1.0:
+            raise ValueError("pme_mesh_factor must be at least 1.0.")
         self.pme_interpolation_nodes = int(pme_interpolation_nodes)
         self.pme_mesh_factor = float(pme_mesh_factor)
         self._external_feats: Optional[torch.Tensor] = None
@@ -169,15 +170,15 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         cls,
         features: GTOElectrostaticFeatures,
         external_scale: float = 1.0,
-        kspace_method: str = "direct",
-        pme_interpolation_nodes: int = 5,
-        pme_mesh_factor: float = 3.0,
+        method: Optional[str] = "direct",
+        pme_interpolation_nodes: int = PME_DEFAULT_INTERPOLATION_NODES,
+        pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
     ) -> "GTOElectrostaticExternalSourceFeatures":
         """Wrap an existing feature block without changing its parameters."""
         return cls(
             features,
             external_scale=external_scale,
-            kspace_method=kspace_method,
+            method=method,
             pme_interpolation_nodes=pme_interpolation_nodes,
             pme_mesh_factor=pme_mesh_factor,
         )
@@ -201,7 +202,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         """Set one evaluation's external sources, or clear them with all ``None``.
 
         ``cell`` ([n_graphs, 3, 3] or [3, 3]) is the periodic cell the
-        k-vectors were built from; it is required when ``kspace_method="pme"``.
+        k-vectors were built from; it is required when ``method="PME"``.
         """
         values = (external_feats, external_positions, external_batch)
         if all(value is None for value in values):
@@ -479,10 +480,10 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         cell: Optional[torch.Tensor] = None,
     ) -> dict:
         source_cache = {}
-        if self.kspace_method == "pme":
+        if self.use_pme:
             if cell is None:
                 raise ValueError(
-                    "kspace_method='pme' needs the cell: pass cell= to "
+                    "method='PME' needs the cell: pass cell= to "
                     "set_external_sources or the source-target call."
                 )
             # no [n_k, n_src] tables: sources are spread onto a mesh instead

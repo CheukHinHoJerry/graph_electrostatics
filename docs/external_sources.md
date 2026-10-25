@@ -96,14 +96,14 @@ responsible for clearing the transient external sources after each evaluation.
 In periodic modes the direct source-target path builds dense `[n_k, n_src]`
 cosine and sine tables, so its memory grows with box volume times the number
 of external sources.  For large MM environments, select the particle-mesh
-source side instead:
+source side with `method="PME"`; any other value keeps the direct sum:
 
 ```python
 features = GTOElectrostaticExternalSourceFeatures.from_features(
     model.electric_potential_descriptor,
-    kspace_method="pme",          # default "direct"
-    pme_interpolation_nodes=5,    # P3M B-spline order, 1-5
-    pme_mesh_factor=3.0,          # mesh oversampling over 2*max|n|+1
+    method="PME",                 # default "direct"
+    pme_interpolation_nodes=5,    # optional, P3M B-spline order 1-5 (default 5)
+    pme_mesh_factor=3.0,          # optional, oversampling over 2*max|n|+1 (default 3.0)
 )
 features.set_external_sources(
     external_feats=environment_multipoles,
@@ -118,10 +118,11 @@ weights, Fourier transformed and deconvolved, then read off at the same
 k-vectors as the direct path; the target-side projection and all slab and
 molecule corrections are unchanged and exact.  The `cell` must be the one the
 k-vectors were generated from (`k = 2 pi n inv(cell)^T`); a mismatch raises.
-This path requires `torch-pme`.
+This path requires the optional `torch-pme` package; the direct path does not.
 
-Accuracy is controlled by `pme_mesh_factor` (relative feature error for
-`pme_interpolation_nodes=5`: about 5e-5 at 2.0, 7e-6 at 3.0, 1e-6 at 4.0).
+Accuracy is controlled by `pme_mesh_factor` (maximum relative feature error
+against the direct sum for 20k sources and `pme_interpolation_nodes=5`: about
+8e-6 at 2.0, 9e-7 at 3.0, 2e-7 at 4.0).
 Measured on one H200 (float64, forward and backward, `density_max_l=1`,
 `feature_max_l=1`, kspace cutoff 2.5, 111 targets):
 

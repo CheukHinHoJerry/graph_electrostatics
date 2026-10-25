@@ -27,14 +27,18 @@ from scipy.constants import pi
 
 try:
     from torchpme.lib import MeshInterpolator
-except ImportError:  # optional dependency, only needed for kspace_method="pme"
+except ImportError:  # optional dependency, only needed for method="PME"
     MeshInterpolator = None
+
+# ~1e-6 relative error against the direct sum (see docs/external_sources.md)
+PME_DEFAULT_INTERPOLATION_NODES = 5
+PME_DEFAULT_MESH_FACTOR = 3.0
 
 
 def _require_torchpme() -> None:
     if MeshInterpolator is None:
         raise ImportError(
-            "kspace_method='pme' requires torch-pme (pip install torch-pme)."
+            "method='PME' requires torch-pme (pip install torch-pme)."
         )
 
 
@@ -175,4 +179,9 @@ def pme_structure_factor(
     return coeff_cos, coeff_sin
 
 
-__all__ = ["precompute_pme_source_geometry", "pme_structure_factor"]
+__all__ = [
+    "PME_DEFAULT_INTERPOLATION_NODES",
+    "PME_DEFAULT_MESH_FACTOR",
+    "precompute_pme_source_geometry",
+    "pme_structure_factor",
+]
