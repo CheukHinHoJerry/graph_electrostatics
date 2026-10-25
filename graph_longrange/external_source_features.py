@@ -14,11 +14,12 @@ import torch
 
 from .features import (
     FeaturePBCHandling, GTOElectrostaticFeatures,
-    assemble_fourier_series_batch, apply_coulomb_kernel_batch,
-    project_to_features_batch, compute_coulomb_factor,
+    assemble_fourier_series_batch, assemble_fourier_series_from_coefficients,
+    apply_coulomb_kernel_batch, project_to_features_batch, compute_coulomb_factor,
 )
 from .slabs import slab_dipole_correction_node_fields_source_target
 from .external_source_realspace import _ExternalSourceRealspace
+from .external_source_pme import precompute_pme_source_geometry, pme_structure_factor
 
 
 class _ExternalSourceCorrections:
@@ -127,6 +128,13 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
     ``external_scale`` lets a caller split a physical external potential
     across several channels.  Its default is one; PolarMACE, for example, uses
     one half for each of its alpha and beta channels.
+
+    ``kspace_method`` selects how the periodic source side is evaluated.
+    ``"direct"`` sums over sources exactly with dense ``[n_k, n_src]`` tables;
+    ``"pme"`` spreads the sources onto a mesh and uses an FFT instead (see
+    :mod:`graph_longrange.external_source_pme`), which needs the cell and
+    torch-pme but scales to large external environments.  The target side is
+    always projected exactly.
     """
 
     _EXTERNAL_FIELD_CACHE_KEY = "_graph_longrange_external_field"
@@ -135,22 +143,44 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         self,
         base: GTOElectrostaticFeatures,
         external_scale: float = 1.0,
+        kspace_method: str = "direct",
+        pme_interpolation_nodes: int = 5,
+        pme_mesh_factor: float = 3.0,
     ) -> None:
         super().__init__()
+        if kspace_method not in ("direct", "pme"):
+            raise ValueError(
+                f"kspace_method must be 'direct' or 'pme', got {kspace_method!r}."
+            )
+        if pme_mesh_factor < 1.0:
+            raise ValueError("pme_mesh_factor must be at least 1.0.")
         self.base = base
         self.external_scale = float(external_scale)
+        self.kspace_method = kspace_method
+        self.pme_interpolation_nodes = int(pme_interpolation_nodes)
+        self.pme_mesh_factor = float(pme_mesh_factor)
         self._external_feats: Optional[torch.Tensor] = None
         self._external_positions: Optional[torch.Tensor] = None
         self._external_batch: Optional[torch.Tensor] = None
+        self._external_cell: Optional[torch.Tensor] = None
 
     @classmethod
     def from_features(
         cls,
         features: GTOElectrostaticFeatures,
         external_scale: float = 1.0,
+        kspace_method: str = "direct",
+        pme_interpolation_nodes: int = 5,
+        pme_mesh_factor: float = 3.0,
     ) -> "GTOElectrostaticExternalSourceFeatures":
         """Wrap an existing feature block without changing its parameters."""
-        return cls(features, external_scale=external_scale)
+        return cls(
+            features,
+            external_scale=external_scale,
+            kspace_method=kspace_method,
+            pme_interpolation_nodes=pme_interpolation_nodes,
+            pme_mesh_factor=pme_mesh_factor,
+        )
 
     def __getattr__(self, name):
         try:
@@ -166,8 +196,13 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         external_feats: Optional[torch.Tensor] = None,
         external_positions: Optional[torch.Tensor] = None,
         external_batch: Optional[torch.Tensor] = None,
+        cell: Optional[torch.Tensor] = None,
     ) -> None:
-        """Set one evaluation's external sources, or clear them with all ``None``."""
+        """Set one evaluation's external sources, or clear them with all ``None``.
+
+        ``cell`` ([n_graphs, 3, 3] or [3, 3]) is the periodic cell the
+        k-vectors were built from; it is required when ``kspace_method="pme"``.
+        """
         values = (external_feats, external_positions, external_batch)
         if all(value is None for value in values):
             self.clear_external_sources()
@@ -180,11 +215,13 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         self._external_feats = external_feats
         self._external_positions = external_positions
         self._external_batch = external_batch
+        self._external_cell = cell
 
     def clear_external_sources(self) -> None:
         self._external_feats = None
         self._external_positions = None
         self._external_batch = None
+        self._external_cell = None
 
     @staticmethod
     def _normalise_source_feats(source_feats: torch.Tensor) -> torch.Tensor:
@@ -206,6 +243,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=geometry["batch"],
             volume=geometry["volume"],
             pbc=geometry["pbc"],
+            cell=self._external_cell,
         )
         return self.forward_dynamic_source_target(
             cache=cache,
@@ -325,6 +363,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Field features at ``tgt_positions`` from the charges at ``src_positions``.
 
@@ -355,6 +394,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
         self.static_quantities = cache
         return self._select_forward_dynamic_source_target_impl()(
@@ -373,6 +413,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         # ~1.6 ms at 58,928 sources x 111 targets, against a ~93 ms model step
         self._check_source_target_disjoint(src_positions, tgt_positions)
@@ -387,6 +428,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
         self.static_quantities = cache
         return cache
@@ -412,6 +454,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         return {
             "mode": "st_realspace",
@@ -433,13 +476,33 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
-        inner_src = torch.matmul(k_vectors, src_positions.t())
-        mask_src_f = (k_vector_batch[:, None] == src_batch[None, :]).to(
-            dtype=inner_src.dtype
-        )
-        cosines_src = torch.cos(inner_src) * mask_src_f
-        sines_src = torch.sin(inner_src) * mask_src_f
+        source_cache = {}
+        if self.kspace_method == "pme":
+            if cell is None:
+                raise ValueError(
+                    "kspace_method='pme' needs the cell: pass cell= to "
+                    "set_external_sources or the source-target call."
+                )
+            # no [n_k, n_src] tables: sources are spread onto a mesh instead
+            source_cache["pme_geometry"] = precompute_pme_source_geometry(
+                k_vectors=k_vectors,
+                k_vector_batch=k_vector_batch,
+                src_positions=src_positions,
+                src_batch=src_batch,
+                cell=cell,
+                n_graphs=volume.reshape(-1).shape[0],
+                interpolation_nodes=self.pme_interpolation_nodes,
+                mesh_factor=self.pme_mesh_factor,
+            )
+        else:
+            inner_src = torch.matmul(k_vectors, src_positions.t())
+            mask_src_f = (k_vector_batch[:, None] == src_batch[None, :]).to(
+                dtype=inner_src.dtype
+            )
+            source_cache["cosines_src"] = torch.cos(inner_src) * mask_src_f
+            source_cache["sines_src"] = torch.sin(inner_src) * mask_src_f
 
         inner_tgt = torch.matmul(k_vectors, tgt_positions.t())
         mask_tgt_f = (k_vector_batch[:, None] == tgt_batch[None, :]).to(
@@ -470,8 +533,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             "tgt_positions": tgt_positions,
             "tgt_batch": tgt_batch,
             "pbc": pbc,
-            "cosines_src": cosines_src,
-            "sines_src": sines_src,
+            **source_cache,
             "cosines_tgt": cosines_tgt,
             "sines_tgt": sines_tgt,
             "density_basis_fs": density_basis_fs,
@@ -490,6 +552,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         return self._precompute_geometry_source_target_periodic_common(
             k_vectors=k_vectors,
@@ -502,6 +565,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
 
     def _precompute_geometry_source_target_slab(
@@ -516,6 +580,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         return self._precompute_geometry_source_target_periodic_common(
             k_vectors=k_vectors,
@@ -528,6 +593,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
 
     def _precompute_geometry_source_target_molecule_in_box(
@@ -542,6 +608,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         return self._precompute_geometry_source_target_periodic_common(
             k_vectors=k_vectors,
@@ -554,6 +621,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
 
     def _precompute_geometry_source_target_mixed_periodic(
@@ -568,6 +636,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         cache = self._precompute_geometry_source_target_periodic_common(
             k_vectors=k_vectors,
@@ -580,6 +649,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
         pbc_bool = pbc.to(dtype=torch.bool)
         is_molecule_graph = (~pbc_bool).all(dim=1)
@@ -603,6 +673,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         tgt_batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
     ) -> dict:
         if torch.any(pbc):
             return self._precompute_geometry_source_target_mixed_periodic(
@@ -616,6 +687,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
                 tgt_batch=tgt_batch,
                 volume=volume,
                 pbc=pbc,
+                cell=cell,
             )
         return self._precompute_geometry_source_target_realspace(
             k_vectors=k_vectors,
@@ -628,6 +700,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             tgt_batch=tgt_batch,
             volume=volume,
             pbc=pbc,
+            cell=cell,
         )
 
     def _forward_dynamic_source_target_realspace(
@@ -646,13 +719,26 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         self, source_feats: torch.Tensor, cache: dict
     ) -> torch.Tensor:
         self._require_cache_mode(cache, "st_pbc")
-        density = assemble_fourier_series_batch(
-            source_feats=source_feats,
-            cosines=cache["cosines_src"],
-            sines=cache["sines_src"],
-            density_basis_fs=cache["density_basis_fs"],
-            volume_per_k=cache["volume_per_k"],
-        )
+        if "pme_geometry" in cache:
+            coeff_cos, coeff_sin = pme_structure_factor(
+                source_feats=source_feats,
+                pme_geometry=cache["pme_geometry"],
+                n_k_total=cache["k_norm2"].shape[0],
+            )
+            density = assemble_fourier_series_from_coefficients(
+                coeff_cos=coeff_cos,
+                coeff_sin=coeff_sin,
+                density_basis_fs=cache["density_basis_fs"],
+                volume_per_k=cache["volume_per_k"],
+            )
+        else:
+            density = assemble_fourier_series_batch(
+                source_feats=source_feats,
+                cosines=cache["cosines_src"],
+                sines=cache["sines_src"],
+                density_basis_fs=cache["density_basis_fs"],
+                volume_per_k=cache["volume_per_k"],
+            )
         potential = apply_coulomb_kernel_batch(
             density=density,
             k_factor_coulomb=cache["k_factor_coulomb"],
