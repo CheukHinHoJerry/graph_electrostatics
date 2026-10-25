@@ -88,9 +88,16 @@ def precompute_pme_source_geometry(
             continue
         cell_g = cell[g].to(dtype=src_positions.dtype)
         with torch.no_grad():
-            m_float = k_vectors[k_rows].detach() @ cell_g.detach().t() / (2 * pi)
+            # Single-precision k-vectors can sit ~1e-2 off the lattice (TF32
+            # matmuls give that at |n| ~ 30); indices are a whole unit apart,
+            # so rounding is still exact and 0.25 still rejects a wrong cell.
+            m_float = (
+                k_vectors[k_rows].detach().double()
+                @ cell_g.detach().double().t()
+                / (2 * pi)
+            )
             m_int = torch.round(m_float)
-            if (m_float - m_int).abs().max() > 1e-4:
+            if (m_float - m_int).abs().max() > 0.25:
                 raise ValueError(
                     "k_vectors are not integer combinations of 2*pi*inv(cell)^T: "
                     "pass the cell the k-vectors were generated from."

@@ -218,3 +218,16 @@ def test_pme_validates_inputs():
         _features(pme, geometry, system)
     with pytest.raises(ValueError, match="integer combinations"):
         _features(pme, geometry, system, cell=cells * 1.37)
+
+
+def test_pme_float32_matches_direct():
+    torch.set_default_dtype(torch.float32)
+    cells = _cells()[:1] * 4.0  # larger |n| makes single-precision k rounding visible
+    direct, pme = _pair(1, 1, "pbc")
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [200], [5], 4, seed=13)
+
+    expected = _features(direct, geometry, system)
+    actual = _features(pme, geometry, system, cell=cells)
+    assert actual.dtype == torch.float32
+    _assert_close_scaled(actual, expected, rel=1e-3)
