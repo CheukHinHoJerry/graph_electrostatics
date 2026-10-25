@@ -231,3 +231,169 @@ def test_pme_float32_matches_direct():
     actual = _features(pme, geometry, system, cell=cells)
     assert actual.dtype == torch.float32
     _assert_close_scaled(actual, expected, rel=1e-3)
+
+
+def test_pme_split_api_reuses_geometry_for_new_source_feats():
+    cells = _cells()[:1]
+    direct, pme = _pair(1, 1, "pbc")
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [50], [4], 4, seed=17)
+    positions = {
+        key: system[key]
+        for key in ("src_positions", "src_batch", "tgt_positions", "tgt_batch")
+    }
+    direct_cache = direct.precompute_geometry_source_target(**geometry, **positions)
+    pme_cache = pme.precompute_geometry_source_target(**geometry, **positions, cell=cells)
+    assert "cosines_src" not in pme_cache and "sines_src" not in pme_cache
+
+    for seed in (0, 1):
+        feats = torch.randn(50, 4, generator=torch.Generator().manual_seed(seed))
+        expected = direct.forward_dynamic_source_target(direct_cache, feats)
+        actual = pme.forward_dynamic_source_target(pme_cache, feats.unsqueeze(-2))
+        _assert_close_scaled(actual, expected, rel=5e-5)
+
+
+def test_pme_cell_gradient_matches_direct():
+    system = _system(_cells()[:1], [40], [4], 4, seed=19)
+    frac = {
+        key: system[key] @ torch.linalg.inv(_cells()[0])
+        for key in ("src_positions", "tgt_positions")
+    }
+    grads = []
+    for method in ("direct", "pme"):
+        cells = _cells()[:1].clone().requires_grad_()
+        rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
+        k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+            2.5, cells, rcells
+        )
+        block = GTOElectrostaticExternalSourceFeatures.from_features(
+            _base(1, 1, "pbc"), kspace_method=method
+        )
+        features = block.forward_source_target(
+            k_vectors=k_vectors,
+            k_norm2=k_norm2,
+            k_vector_batch=k_vector_batch,
+            k0_mask=k0_mask,
+            source_feats=system["source_feats"],
+            src_positions=frac["src_positions"] @ cells[0],
+            src_batch=system["src_batch"],
+            tgt_positions=frac["tgt_positions"] @ cells[0],
+            tgt_batch=system["tgt_batch"],
+            volume=torch.det(cells),
+            pbc=torch.tensor([[True, True, True]]),
+            cell=cells if method == "pme" else None,
+        )
+        (features ** 2).sum().backward()
+        grads.append(cells.grad)
+    _assert_close_scaled(grads[1], grads[0], rel=5e-4)
+
+
+def test_pme_is_periodic_in_source_images():
+    cells = _cells()[:1]
+    _, pme = _pair(1, 1, "pbc")
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [30], [4], 4, seed=23)
+    shifts = torch.randint(-3, 4, (30, 3), generator=torch.Generator().manual_seed(0))
+    unwrapped = dict(system, src_positions=system["src_positions"] + shifts.double() @ cells[0])
+
+    expected = _features(pme, geometry, system, cell=cells)
+    actual = _features(pme, geometry, unwrapped, cell=cells)
+    _assert_close_scaled(actual, expected, rel=1e-10)
+
+
+def test_pme_is_translation_invariant():
+    cells = _cells()[:1]
+    direct, pme = _pair(1, 1, "pbc")
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [40], [4], 4, seed=29)
+    offset = torch.tensor([0.37, -1.91, 2.53])
+    shifted = dict(
+        system,
+        src_positions=system["src_positions"] + offset,
+        tgt_positions=system["tgt_positions"] + offset,
+    )
+
+    expected = _features(direct, geometry, system)
+    actual = _features(pme, geometry, shifted, cell=cells)
+    _assert_close_scaled(actual, expected, rel=5e-5)
+
+
+@pytest.mark.parametrize("nodes,rel", [(3, 2e-3), (4, 5e-4), (5, 5e-5)])
+def test_pme_interpolation_orders(nodes, rel):
+    cells = _cells()[:1]
+    direct, pme = _pair(1, 1, "pbc", pme_interpolation_nodes=nodes)
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [60], [5], 4, seed=31)
+
+    expected = _features(direct, geometry, system)
+    actual = _features(pme, geometry, system, cell=cells)
+    _assert_close_scaled(actual, expected, rel=rel)
+
+
+def test_pme_broadcasts_single_cell_and_rejects_wrong_count():
+    cells = torch.cat([_cells()[:1], _cells()[:1]])
+    direct, pme = _pair(0, 0, "pbc")
+    geometry = _geometry(cells, "pbc")
+    system = _system(cells, [20, 25], [3, 2], 1, seed=37)
+
+    expected = _features(direct, geometry, system)
+    _assert_close_scaled(_features(pme, geometry, system, cell=cells[0]), expected, rel=5e-5)
+    with pytest.raises(ValueError, match="graphs"):
+        _features(pme, geometry, system, cell=torch.cat([cells, cells[:1]]))
+
+
+def test_pme_empty_source_and_target_sets():
+    cells = _cells()[:1]
+    direct, pme = _pair(1, 1, "pbc")
+    geometry = _geometry(cells, "pbc")
+
+    no_sources = _system(cells, [0], [3], 4)
+    torch.testing.assert_close(
+        _features(pme, geometry, no_sources, cell=cells),
+        _features(direct, geometry, no_sources),
+    )
+    no_targets = _system(cells, [10], [0], 4)
+    actual = _features(pme, geometry, no_targets, cell=cells)
+    assert actual.shape == _features(direct, geometry, no_targets).shape == (0, 8)
+
+
+def test_pme_mixed_periodic_batch_with_slab_and_bulk_graphs():
+    cells = _cells()
+    rcells = 2 * pi * torch.linalg.inv(cells).transpose(-1, -2)
+    k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(2.5, cells, rcells)
+    geometry = {
+        "k_vectors": k_vectors,
+        "k_norm2": k_norm2,
+        "k_vector_batch": k_vector_batch,
+        "k0_mask": k0_mask,
+        "volume": torch.det(cells).abs(),
+        "pbc": torch.tensor([[True, True, False], [True, True, True]]),
+    }
+    system = _system(cells, [40, 35], [4, 3], 4, seed=41)
+    for handling in ("mixed_periodic", "auto"):
+        direct, pme = _pair(1, 1, handling)
+        expected = _features(direct, geometry, system)
+        actual = _features(pme, geometry, system, cell=cells)
+        _assert_close_scaled(actual, expected, rel=5e-5)
+
+
+def test_pme_auto_without_periodicity_needs_no_cell():
+    cells = _cells()[:1]
+    direct, pme = _pair(1, 1, "auto")
+    geometry = dict(_geometry(cells, "pbc"), pbc=torch.tensor([[False, False, False]]))
+    system = _system(cells, [20], [3], 4, seed=43)
+
+    torch.testing.assert_close(
+        _features(pme, geometry, system), _features(direct, geometry, system)
+    )
+
+
+def test_pme_missing_torchpme_raises_import_error(monkeypatch):
+    import graph_longrange.external_source_pme as pme_module
+
+    monkeypatch.setattr(pme_module, "MeshInterpolator", None)
+    cells = _cells()[:1]
+    _, pme = _pair(0, 0, "pbc")
+    system = _system(cells, [5], [2], 1)
+    with pytest.raises(ImportError, match="torch-pme"):
+        _features(pme, _geometry(cells, "pbc"), system, cell=cells)
