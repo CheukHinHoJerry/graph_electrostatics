@@ -90,3 +90,44 @@ The energy wrapper returns `E(A) + E_cross(A, B)`, which is equal to
 `E(A + B) - E(B)`.  The feature wrapper returns the normal same-set features
 plus `external_scale` times the source-to-target field.  Adapters remain
 responsible for clearing the transient external sources after each evaluation.
+
+## Large external environments: PME source side
+
+In periodic modes the direct source-target path builds dense `[n_k, n_src]`
+cosine and sine tables, so its memory grows with box volume times the number
+of external sources.  For large MM environments, select the particle-mesh
+source side with `method="PME"`; any other value keeps the direct sum:
+
+```python
+features = GTOElectrostaticExternalSourceFeatures.from_features(
+    model.electric_potential_descriptor,
+    method="PME",                 # default "direct"
+    pme_interpolation_nodes=5,    # optional, P3M B-spline order 1-5 (default 5)
+    pme_mesh_factor=3.0,          # optional, oversampling over 2*max|n|+1 (default 3.0)
+)
+features.set_external_sources(
+    external_feats=environment_multipoles,
+    external_positions=environment_positions,
+    external_batch=environment_batch,
+    cell=cell,                    # [n_graphs, 3, 3], the cell the k-vectors came from
+)
+```
+
+The source multipole channels are spread onto a mesh with torch-pme's P3M
+weights, Fourier transformed and deconvolved, then read off at the same
+k-vectors as the direct path; the target-side projection and all slab and
+molecule corrections are unchanged and exact.  The `cell` must be the one the
+k-vectors were generated from (`k = 2 pi n inv(cell)^T`); a mismatch raises.
+This path requires the optional `torch-pme` package; the direct path does not.
+
+Accuracy is controlled by `pme_mesh_factor` (maximum relative feature error
+against the direct sum for 20k sources and `pme_interpolation_nodes=5`: about
+8e-6 at 2.0, 9e-7 at 3.0, 2e-7 at 4.0).
+Measured on one H200 (float64, forward and backward, `density_max_l=1`,
+`feature_max_l=1`, kspace cutoff 2.5, 111 targets):
+
+| box (A) | sources | k-vectors | direct peak | PME peak |
+|---|---|---|---|---|
+| 40 | 6,400 | 8,440 | 3.24 GiB | 0.30 GiB |
+| 60 | 21,600 | 28,526 | 36.8 GiB | 1.03 GiB |
+| 84 | 58,928 | 78,182 | out of memory | 2.90 GiB |
