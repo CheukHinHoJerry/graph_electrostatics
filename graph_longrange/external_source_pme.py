@@ -149,6 +149,41 @@ def precompute_pme_source_geometry(
     return graphs
 
 
+def assemble_density_from_structure_factor(
+    coeff_cos: torch.Tensor,
+    coeff_sin: torch.Tensor,
+    density_basis_fs: torch.Tensor,
+    volume_per_k: torch.Tensor,
+) -> torch.Tensor:
+    """rho(k) from per-channel structure factors.
+
+    The same assembly as ``features.assemble_fourier_series_batch`` after its
+    ``cosines @ source_feats`` / ``sines @ source_feats`` products, which PME
+    replaces.
+
+    Args:
+        coeff_cos: [n_k_total, m_dim], sum_s cos(k.r_s) f_s
+        coeff_sin: [n_k_total, m_dim], sum_s sin(k.r_s) f_s
+        density_basis_fs: [n_k_total, n_sigma(=1), m_dim, 2]
+        volume_per_k: [n_k_total]
+    Returns:
+        density: [n_k_total, 2]
+    """
+    sm_dim = density_basis_fs.size(1) * density_basis_fs.size(2)
+    density_basis_r = density_basis_fs[..., 0].reshape(density_basis_fs.size(0), sm_dim)
+    density_basis_i = density_basis_fs[..., 1].reshape(density_basis_fs.size(0), sm_dim)
+
+    rho_real = (density_basis_r * coeff_cos).sum(dim=-1) + (
+        density_basis_i * coeff_sin
+    ).sum(dim=-1)
+    rho_imag = (density_basis_i * coeff_cos).sum(dim=-1) - (
+        density_basis_r * coeff_sin
+    ).sum(dim=-1)
+
+    density = torch.stack([rho_real, rho_imag], dim=-1)
+    return (2 * pi) ** 3 * density / volume_per_k.unsqueeze(-1)
+
+
 def pme_structure_factor(
     source_feats: torch.Tensor,
     pme_geometry: List[dict],
@@ -182,6 +217,7 @@ def pme_structure_factor(
 __all__ = [
     "PME_DEFAULT_INTERPOLATION_NODES",
     "PME_DEFAULT_MESH_FACTOR",
+    "assemble_density_from_structure_factor",
     "precompute_pme_source_geometry",
     "pme_structure_factor",
 ]

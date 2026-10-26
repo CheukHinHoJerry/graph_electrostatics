@@ -14,14 +14,15 @@ import torch
 
 from .features import (
     FeaturePBCHandling, GTOElectrostaticFeatures,
-    assemble_fourier_series_batch, assemble_fourier_series_from_coefficients,
-    apply_coulomb_kernel_batch, project_to_features_batch, compute_coulomb_factor,
+    assemble_fourier_series_batch, apply_coulomb_kernel_batch,
+    project_to_features_batch, compute_coulomb_factor,
 )
 from .slabs import slab_dipole_correction_node_fields_source_target
 from .external_source_realspace import _ExternalSourceRealspace
 from .external_source_pme import (
     PME_DEFAULT_INTERPOLATION_NODES, PME_DEFAULT_MESH_FACTOR,
-    precompute_pme_source_geometry, pme_structure_factor,
+    assemble_density_from_structure_factor, precompute_pme_source_geometry,
+    pme_structure_factor,
 )
 
 
@@ -726,7 +727,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
                 pme_geometry=cache["pme_geometry"],
                 n_k_total=cache["k_norm2"].shape[0],
             )
-            density = assemble_fourier_series_from_coefficients(
+            density = assemble_density_from_structure_factor(
                 coeff_cos=coeff_cos,
                 coeff_sin=coeff_sin,
                 density_basis_fs=cache["density_basis_fs"],

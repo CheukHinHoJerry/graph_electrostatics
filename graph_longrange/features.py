@@ -47,35 +47,13 @@ def assemble_fourier_series_batch(
     Returns:
         density: [n_k_total, 2]
     """
-    coeff_cos = torch.matmul(cosines, source_feats)
-    coeff_sin = torch.matmul(sines, source_feats)
-    return assemble_fourier_series_from_coefficients(
-        coeff_cos=coeff_cos,
-        coeff_sin=coeff_sin,
-        density_basis_fs=density_basis_fs,
-        volume_per_k=volume_per_k,
-    )
-
-
-def assemble_fourier_series_from_coefficients(
-    coeff_cos: torch.Tensor,
-    coeff_sin: torch.Tensor,
-    density_basis_fs: torch.Tensor,
-    volume_per_k: torch.Tensor,
-) -> torch.Tensor:
-    """Assemble rho(k) from per-channel structure factors.
-
-    Args:
-        coeff_cos: [n_k_total, m_dim], sum_s cos(k.r_s) f_s
-        coeff_sin: [n_k_total, m_dim], sum_s sin(k.r_s) f_s
-        density_basis_fs: [n_k_total, n_sigma(=1), m_dim, 2]
-        volume_per_k: [n_k_total]
-    Returns:
-        density: [n_k_total, 2]
-    """
+    n_nodes = source_feats.size(0)
     n_sigma = density_basis_fs.size(1)
     m_dim = density_basis_fs.size(2)
     sm_dim = n_sigma * m_dim
+
+    coeff_cos = torch.matmul(cosines, source_feats)
+    coeff_sin = torch.matmul(sines, source_feats)
 
     density_basis_r = density_basis_fs[..., 0].reshape(density_basis_fs.size(0), sm_dim)
     density_basis_i = density_basis_fs[..., 1].reshape(density_basis_fs.size(0), sm_dim)
