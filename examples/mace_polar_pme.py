@@ -7,6 +7,10 @@ and the MM atoms. This is the same wiring as the OpenMM-ML PolarMACE
 embedding; `method="PME"` keeps the MM side memory-bounded for large
 environments.
 
+The MM charges can be treated as Gaussians of the model's density width (the
+default, like ML atoms) or as point charges (`source_width=0.0`); the last
+block compares the two.
+
 Requires mace-torch >= 0.3.17 (ACEsuit/mace main; older releases target an
 older graph_longrange API) and the optional `torch-pme` package for PME.
 
@@ -66,12 +70,16 @@ mm_feats[:, 0] = mm_charges
 mm_batch = torch.zeros(n_mm, dtype=torch.long, device=device)
 
 
-def evaluate(features_block):
+def evaluate(features_block, energy_block=None):
     """Energy, QM forces and MM forces with the given MM-field method."""
     model.electric_potential_descriptor = features_block
+    if energy_block is not None:
+        model.coulomb_energy = energy_block
     positions = mm_positions.clone().requires_grad_()
     features_block.set_external_sources(mm_feats, positions, mm_batch, cell=cell)
-    model.coulomb_energy.set_external_sources(mm_feats, positions, mm_batch)
+    # the energy block needs the cell only for a source width other than the
+    # density width (periodic images of the real-space correction)
+    model.coulomb_energy.set_external_sources(mm_feats, positions, mm_batch, cell=cell)
     try:
         energy = model(dict(data), compute_force=False)["energy"]
         qm_grad, mm_grad = torch.autograd.grad(
@@ -83,6 +91,7 @@ def evaluate(features_block):
     return energy.detach(), -qm_grad, -mm_grad
 
 
+gaussian_energy = model.coulomb_energy  # density-width MM charges (default)
 energy_vacuum = model(dict(data), compute_force=False)["energy"].detach()
 energy, qm_forces, mm_forces = evaluate(pme)
 print(f"energy without MM: {energy_vacuum.item():.6f} eV")
@@ -94,3 +103,19 @@ energy_d, qm_forces_d, mm_forces_d = evaluate(direct)
 print(f"energy difference PME - direct: {(energy - energy_d).abs().item():.1e} eV")
 print(f"max QM force difference: {(qm_forces - qm_forces_d).abs().max():.1e} eV/A")
 print(f"max MM force difference: {(mm_forces - mm_forces_d).abs().max():.1e} eV/A")
+
+# --- MM point charges instead of density-width Gaussians ----------------------
+# The reciprocal-space part is unchanged; a short-ranged real-space correction
+# over MM atoms near the QM water (with periodic images) does the rest.
+point = GTOElectrostaticExternalSourceFeatures.from_features(
+    descriptor, external_scale=0.5, method="PME", source_width=0.0
+)
+point_energy = GTOElectrostaticExternalSourceEnergy.from_energy(
+    gaussian_energy.base, external_width=0.0
+)
+energy_p, qm_forces_p, mm_forces_p = evaluate(point, point_energy)
+sigma_d = descriptor.realspace_features.density_smearing_width
+print(f"MM charges as point charges instead of {sigma_d:.2f} A Gaussians:")
+print(f"  energy shift: {(energy_p - energy).item():+.6f} eV")
+print(f"  max QM force change: {(qm_forces_p - qm_forces).abs().max():.3e} eV/A")
+print(f"  max MM force change: {(mm_forces_p - mm_forces).abs().max():.3e} eV/A")

@@ -131,3 +131,48 @@ Measured on one H200 (float64, forward and backward, `density_max_l=1`,
 | 40 | 6,400 | 8,440 | 3.24 GiB | 0.30 GiB |
 | 60 | 21,600 | 28,526 | 36.8 GiB | 1.03 GiB |
 | 84 | 58,928 | 78,182 | out of memory | 2.90 GiB |
+
+## Width of the external sources
+
+By default the external sources are Gaussians of the model's own
+`density_smearing_width`, exactly like the model's atoms.  Both wrappers accept
+a width for the external set instead, down to point charges:
+
+```python
+features = GTOElectrostaticExternalSourceFeatures.from_features(
+    model.electric_potential_descriptor,
+    external_scale=0.5,
+    source_width=0.0,             # Angstrom; None = density width, 0.0 = point charges
+    correction_cutoff=None,       # optional override, Angstrom
+    correction_budget_bytes=256 << 20,  # working-memory bound of the correction
+)
+energy = GTOElectrostaticExternalSourceEnergy.from_energy(
+    model.coulomb_energy,
+    external_width=0.0,           # the cross block's `target_width`
+)
+energy.set_external_sources(..., cell=cell)   # the cell is needed for a changed width
+```
+
+`None` reproduces the default bit for bit.  For any other width the
+reciprocal-space evaluation (direct or PME) is left unchanged and the difference
+between a source of width `w` and one of the density width `sigma_d`, as seen
+through a feature Gaussian of width `sigma_f`,
+
+```
+[erf(d / sqrt(2 (w^2 + sigma_f^2))) - erf(d / sqrt(2 (sigma_d^2 + sigma_f^2)))] / d
+```
+
+(and the analogous kernel with the density width in place of `sigma_f` for the
+energy) is added as a real-space sum over source-target pairs within a cutoff,
+including periodic images, so the cutoff may exceed half the box.  The kernel
+difference decays like `erfc`; the default cutoffs,
+`4 sqrt(max(sigma_d, w)^2 + max(sigma_f)^2)` for the features and
+`4 sqrt(sigma_d^2 + max(sigma_d, w)^2)` for the energy, leave a tail of about
+`6e-5 / r`.  The pure real-space (non-periodic) path uses the requested width
+directly.  Supported for density and feature angular orders up to 1.
+
+Two caveats: the hard cutoff makes forces piecewise (the derivative tail at the
+default cutoff is about `1e-3 / r^2`), and the regularised `1/(d + 1e-6)` of the
+library's kernels is shared, so exactly coincident sites get the same (wrong)
+limit as everywhere else in graph_longrange.
+
