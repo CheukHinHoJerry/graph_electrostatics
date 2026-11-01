@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+import math
+
 import torch
 
 from .features import (
@@ -18,7 +20,10 @@ from .features import (
     project_to_features_batch, compute_coulomb_factor,
 )
 from .slabs import slab_dipole_correction_node_fields_source_target
-from .external_source_realspace import _ExternalSourceRealspace
+from .external_source_realspace import (
+    _ExternalSourceRealspace,
+    bipartite_pairs_within_cutoff,
+)
 from .external_source_pme import (
     PME_DEFAULT_INTERPOLATION_NODES, PME_DEFAULT_MESH_FACTOR,
     assemble_density_from_structure_factor, precompute_pme_source_geometry,
@@ -140,6 +145,16 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
     ``pme_interpolation_nodes`` and ``pme_mesh_factor`` tune its accuracy.  Any
     other value keeps the original direct sum over dense ``[n_k, n_src]``
     tables.  The target side is always projected exactly.
+
+    ``source_width`` sets the Gaussian width of the external sources.  ``None``
+    (the default) treats them exactly like the model's own density, i.e. with
+    ``density_smearing_width``; ``0.0`` makes them point charges and any value
+    in between a narrower Gaussian.  Reciprocal-space paths keep evaluating the
+    density-width sources and add a real-space correction over source-target
+    pairs within ``correction_cutoff`` (default ``4 * sqrt(sigma_d^2 +
+    max(sigma_f)^2)``, where the erf-difference kernel has decayed to about
+    1e-5 of 1/r), including periodic images; the real-space path uses the
+    requested width directly.
     """
 
     _EXTERNAL_FIELD_CACHE_KEY = "_graph_longrange_external_field"
@@ -151,10 +166,18 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         method: Optional[str] = "direct",
         pme_interpolation_nodes: int = PME_DEFAULT_INTERPOLATION_NODES,
         pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
+        source_width: Optional[float] = None,
+        correction_cutoff: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.base = base
         self.external_scale = float(external_scale)
+        if source_width is not None and float(source_width) < 0.0:
+            raise ValueError("source_width must be non-negative.")
+        self.source_width = None if source_width is None else float(source_width)
+        self.correction_cutoff = (
+            None if correction_cutoff is None else float(correction_cutoff)
+        )
         self.method = method
         self.use_pme = isinstance(method, str) and method.upper() == "PME"
         if self.use_pme and pme_mesh_factor < 1.0:
@@ -174,6 +197,8 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         method: Optional[str] = "direct",
         pme_interpolation_nodes: int = PME_DEFAULT_INTERPOLATION_NODES,
         pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
+        source_width: Optional[float] = None,
+        correction_cutoff: Optional[float] = None,
     ) -> "GTOElectrostaticExternalSourceFeatures":
         """Wrap an existing feature block without changing its parameters."""
         return cls(
@@ -182,7 +207,73 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             method=method,
             pme_interpolation_nodes=pme_interpolation_nodes,
             pme_mesh_factor=pme_mesh_factor,
+            source_width=source_width,
+            correction_cutoff=correction_cutoff,
         )
+
+    # ---- source width -----------------------------------------------------
+
+    @property
+    def _needs_width_correction(self) -> bool:
+        """True when the sources must differ from the density-width Gaussians."""
+        if self.source_width is None:
+            return False
+        return self.source_width != float(self.base.realspace_features.density_smearing_width)
+
+    @property
+    def effective_correction_cutoff(self) -> float:
+        if self.correction_cutoff is not None:
+            return self.correction_cutoff
+        block = self.base.realspace_features
+        widest = max(float(w) for w in block.projection_smearing_widths)
+        return 4.0 * math.sqrt(float(block.density_smearing_width) ** 2 + widest**2)
+
+    def _width_pairs(
+        self,
+        src_positions: torch.Tensor,
+        src_batch: torch.Tensor,
+        tgt_positions: torch.Tensor,
+        tgt_batch: torch.Tensor,
+        pbc: torch.Tensor,
+        cell: Optional[torch.Tensor],
+    ) -> dict:
+        if not self._needs_width_correction:
+            return {}
+        if cell is None and bool(pbc.any()):
+            raise ValueError(
+                "source_width differs from the density width on a periodic "
+                "graph: pass cell= so the real-space width correction can "
+                "include periodic images."
+            )
+        edge_index, shifts = bipartite_pairs_within_cutoff(
+            src_positions,
+            src_batch,
+            tgt_positions,
+            tgt_batch,
+            self.effective_correction_cutoff,
+            cell=cell,
+            pbc=pbc,
+        )
+        return {"width_edge_index": edge_index, "width_shifts": shifts}
+
+    def _apply_width_correction(
+        self, features: torch.Tensor, source_feats: torch.Tensor, cache: dict
+    ) -> torch.Tensor:
+        if "width_edge_index" not in cache:
+            return features
+        correction = _ExternalSourceRealspace(
+            self.base.realspace_features
+        ).width_correction(
+            source_feats=self._normalise_source_feats(source_feats),
+            src_positions=cache["src_positions"],
+            src_batch=cache["src_batch"],
+            tgt_positions=cache["tgt_positions"],
+            tgt_batch=cache["tgt_batch"],
+            edge_index=cache["width_edge_index"],
+            shifts=cache["width_shifts"],
+            source_width=self.source_width,
+        )
+        return features + correction
 
     def __getattr__(self, name):
         try:
@@ -523,6 +614,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
 
         return {
             "mode": "st_pbc",
+            **self._width_pairs(src_positions, src_batch, tgt_positions, tgt_batch, pbc, cell),
             "k_norm2": k_norm2,
             "k_vector_batch": k_vector_batch,
             "k0_mask": k0_mask,
@@ -715,6 +807,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             src_batch=cache["src_batch"],
             tgt_positions=cache["tgt_positions"],
             tgt_batch=cache["tgt_batch"],
+            source_width=self.source_width if self._needs_width_correction else None,
         )
 
     def _forward_dynamic_source_target_periodic_common(
@@ -758,7 +851,8 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             features_si.size(0), features_si.size(1) * features_si.size(2)
         )
         # No self-interaction subtraction: sources and targets are disjoint.
-        return self._permute_output_channels(features_flat)
+        features_out = self._permute_output_channels(features_flat)
+        return self._apply_width_correction(features_out, source_feats, cache)
 
     def _forward_dynamic_source_target_pbc(
         self, source_feats: torch.Tensor, cache: dict
