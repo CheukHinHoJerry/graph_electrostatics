@@ -1,5 +1,7 @@
 """Internal damped real-space helpers for disjoint source and target sets."""
 
+import math
+
 import torch
 from scipy.constants import pi
 from mace.tools.scatter import scatter_sum
@@ -88,9 +90,13 @@ def bipartite_pairs_within_cutoff(
     cutoff: float,
     cell: torch.Tensor = None,
     pbc: torch.Tensor = None,
-    chunk_size: int = 4096,
+    pair_budget: int = 1 << 22,
 ):
     """(sender, receiver) edges with |r_src + shift - r_tgt| <= cutoff, per graph.
+
+    The distance search is chunked over BOTH sets so that no temporary holds
+    more than ``pair_budget`` source-target pairs (default 4M pairs, i.e. about
+    100 MB of float64 displacements).
 
     Periodic graphs (``pbc`` row has any True) include every lattice image whose
     shift keeps the pair within the cutoff, so the cutoff may exceed half the
@@ -101,6 +107,8 @@ def bipartite_pairs_within_cutoff(
     is added to the sender position (zeros without periodicity). Edges are
     ordered per graph, then per shift, then sender-major.
     """
+    if not (math.isfinite(cutoff) and cutoff > 0.0):
+        raise ValueError(f"cutoff must be finite and positive, got {cutoff!r}.")
     src_batch = src_batch.long()
     tgt_batch = tgt_batch.long()
     device = src_positions.device
@@ -153,27 +161,31 @@ def bipartite_pairs_within_cutoff(
         else:
             shift_vectors = torch.zeros((1, 3), dtype=src_positions.dtype, device=device)
 
-        tgt_g = tgt_positions[t_nodes]
-        for start in range(0, s_nodes.numel(), chunk_size):
-            s_chunk = s_nodes[start : start + chunk_size]
-            disp0 = src_positions[s_chunk][:, None, :] - tgt_g[None, :, :]
-            if periodic:
-                # Bring every pair to its nearest image first, so sources that
-                # drifted several cells away are handled; the neighbour shifts
-                # then cover everything within the cutoff around that image.
-                frac = disp0 @ torch.linalg.inv(cell_g)
-                wrap = torch.round(frac) * pbc[g].to(frac.dtype)
-                base_shift = -(wrap @ cell_g)
-            else:
-                base_shift = torch.zeros_like(disp0)
-            for shift in shift_vectors:
-                disp = disp0 + base_shift + shift
-                within = torch.linalg.norm(disp, dim=-1) <= cutoff
-                if not bool(within.any()):
-                    continue
-                si, ti = within.nonzero(as_tuple=True)
-                edges.append(torch.stack([s_chunk[si], t_nodes[ti]], dim=0))
-                shift_rows.append(base_shift[si, ti] + shift)
+        tgt_chunk = max(1, min(t_nodes.numel(), int(pair_budget)))
+        src_chunk = max(1, int(pair_budget) // tgt_chunk)
+        for t_start in range(0, t_nodes.numel(), tgt_chunk):
+            t_chunk = t_nodes[t_start : t_start + tgt_chunk]
+            tgt_g = tgt_positions[t_chunk]
+            for start in range(0, s_nodes.numel(), src_chunk):
+                s_chunk = s_nodes[start : start + src_chunk]
+                disp0 = src_positions[s_chunk][:, None, :] - tgt_g[None, :, :]
+                if periodic:
+                    # Bring every pair to its nearest image first, so sources that
+                    # drifted several cells away are handled; the neighbour shifts
+                    # then cover everything within the cutoff around that image.
+                    frac = disp0 @ torch.linalg.inv(cell_g)
+                    wrap = torch.round(frac) * pbc[g].to(frac.dtype)
+                    base_shift = -(wrap @ cell_g)
+                else:
+                    base_shift = torch.zeros_like(disp0)
+                for shift in shift_vectors:
+                    disp = disp0 + base_shift + shift
+                    within = torch.linalg.norm(disp, dim=-1) <= cutoff
+                    if not bool(within.any()):
+                        continue
+                    si, ti = within.nonzero(as_tuple=True)
+                    edges.append(torch.stack([s_chunk[si], t_chunk[ti]], dim=0))
+                    shift_rows.append(base_shift[si, ti] + shift)
     if not edges:
         return empty
     return torch.cat(edges, dim=1), torch.cat(shift_rows, dim=0)
@@ -383,6 +395,7 @@ class _ExternalSourceRealspace:
         edge_index: torch.Tensor,
         shifts: torch.Tensor,
         source_width: float,
+        edge_chunk: int = 1 << 18,
     ) -> torch.Tensor:
         """Field of ``source_width`` sources minus the field of density-width sources,
         summed over the given pairs only. Added to a reciprocal-space result that
@@ -397,14 +410,22 @@ class _ExternalSourceRealspace:
             )
             return tgt_positions.new_zeros((tgt_positions.shape[0], n_out))
         common = (source_feats, src_positions, src_batch, tgt_positions, tgt_batch)
-        narrow = self.forward_source_target(
-            *common, edge_index=edge_index, shifts=shifts, source_width=source_width
-        )
-        reference = self.forward_source_target(
-            *common,
-            edge_index=edge_index,
-            shifts=shifts,
-            source_width=self.density_smearing_width,
-        )
-        return narrow - reference
+        # Bounded memory: the l=1 path expands every pair 16-fold, so evaluate
+        # the pairs in chunks and accumulate (the sum is linear in the edges).
+        n_edges = edge_index.shape[1]
+        step = max(1, int(edge_chunk))
+        total = None
+        for start in range(0, n_edges, step):
+            sl = slice(start, min(start + step, n_edges))
+            narrow = self.forward_source_target(
+                *common, edge_index=edge_index[:, sl], shifts=shifts[sl], source_width=source_width
+            )
+            reference = self.forward_source_target(
+                *common,
+                edge_index=edge_index[:, sl],
+                shifts=shifts[sl],
+                source_width=self.density_smearing_width,
+            )
+            total = narrow - reference if total is None else total + (narrow - reference)
+        return total
 

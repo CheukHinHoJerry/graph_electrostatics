@@ -444,3 +444,207 @@ def test_external_source_energy_wrapper_passes_cell_and_width():
     )
     cross = _cross(GTOElectrostaticCrossEnergy.from_energy(energy, target_width=0.0), geometry, system, cell)
     torch.testing.assert_close(total, native + cross, rtol=1e-12, atol=1e-12)
+
+
+# ------------------------------------------------- review follow-ups (round 1)
+
+
+def _image_grid(cell, n):
+    offsets = torch.cartesian_prod(*[torch.arange(-n, n + 1)] * 3).to(cell.dtype)
+    return offsets @ cell
+
+
+def test_pairs_triclinic_cell_match_brute_force_images():
+    cell = torch.tensor([[7.0, 0.0, 0.0], [2.5, 6.0, 0.0], [-1.0, 1.5, 6.5]])
+    system = _system(6, 4, 1, 1, cell, seed=5)
+    system["src_positions"] = system["src_positions"] + torch.tensor([[23.0, -11.0, 4.0]])  # far outside
+    pbc = torch.tensor([[True] * 3])
+    cutoff = 9.0
+    edges, shifts = bipartite_pairs_within_cutoff(
+        system["src_positions"], system["src_batch"], system["tgt_positions"], system["tgt_batch"], cutoff, cell, pbc
+    )
+    got = {(int(s), int(t), tuple(torch.round(sh, decimals=6).tolist())) for s, t, sh in zip(edges[0], edges[1], shifts)}
+    expected = set()
+    for s in range(6):
+        for t in range(4):
+            for image in _image_grid(cell, 6):
+                d = torch.linalg.norm(system["src_positions"][s] + image - system["tgt_positions"][t])
+                if d <= cutoff:
+                    expected.add((s, t, tuple(torch.round(image, decimals=6).tolist())))
+    assert got == expected
+    # chunking must not change the pair set
+    edges_1, shifts_1 = bipartite_pairs_within_cutoff(
+        system["src_positions"], system["src_batch"], system["tgt_positions"], system["tgt_batch"], cutoff, cell, pbc, pair_budget=1
+    )
+    got_1 = {(int(s), int(t), tuple(torch.round(sh, decimals=6).tolist())) for s, t, sh in zip(edges_1[0], edges_1[1], shifts_1)}
+    assert got_1 == expected
+
+
+def test_pairs_partial_periodicity_has_no_images_along_open_axis():
+    cell = torch.diag(torch.tensor([6.0, 6.0, 6.0]))
+    src = torch.tensor([[3.0, 3.0, 5.8]])
+    tgt = torch.tensor([[3.0, 3.0, 0.4]])
+    zero = torch.zeros(1, dtype=torch.long)
+    edges, _ = bipartite_pairs_within_cutoff(src, zero, tgt, zero, 2.0, cell, torch.tensor([[True, True, False]]))
+    assert edges.shape[1] == 0
+
+
+@pytest.mark.parametrize("width", [0.0, 0.5, 2.0])
+def test_periodic_width_change_matches_explicit_image_sum_features(width):
+    # (width-w result) - (default result) must equal the explicit image sum of the
+    # kernel difference, independently of the reciprocal-space evaluation.
+    cell = torch.diag(torch.tensor([7.0, 8.0, 9.0]))
+    base = _features_block(0, 0, "pbc")
+    system = _system(5, 3, 1, 1, cell, seed=2)
+    geometry = _geometry(cell, True)
+    default = _field(GTOElectrostaticExternalSourceFeatures.from_features(base), geometry, system, cell)
+    changed = _field(
+        GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=width, correction_cutoff=30.0),
+        geometry,
+        system,
+        cell,
+    )
+    src = system["src_positions"].numpy()
+    tgt = system["tgt_positions"].numpy()
+    q = system["source_feats"][:, 0].numpy()
+    l0 = base.realspace_features.l0_factors.numpy()
+    images = _image_grid(cell, 5).numpy()
+    expected = np.zeros_like(default.numpy())
+    for t in range(tgt.shape[0]):
+        for s in range(src.shape[0]):
+            d = np.linalg.norm(src[s] + images - tgt[t], axis=1)
+            d = d[d <= 30.0]
+            for r, sigma_f in enumerate(FEATURE_WIDTHS):
+                k_new = erf(d / np.sqrt(2.0 * (width**2 + sigma_f**2))) / (d + 1e-6)
+                k_ref = erf(d / np.sqrt(2.0 * (SIGMA_D**2 + sigma_f**2))) / (d + 1e-6)
+                expected[t, r] += l0[r] * FIELD_CONSTANT / (4 * pi) * q[s] * np.sum(k_new - k_ref)
+    np.testing.assert_allclose((changed - default).numpy(), expected, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("width", [0.0, 2.0])
+def test_periodic_width_change_matches_explicit_image_sum_energy(width):
+    cell = torch.diag(torch.tensor([7.0, 8.0, 9.0]))
+    energy = _energy_block(0, "pbc")
+    system = _system(5, 4, 1, 1, cell, seed=4)
+    geometry = _geometry(cell, True)
+    default = _cross(GTOElectrostaticCrossEnergy.from_energy(energy), geometry, system, cell)
+    changed = _cross(
+        GTOElectrostaticCrossEnergy.from_energy(energy, target_width=width, correction_cutoff=30.0), geometry, system, cell
+    )
+    src = system["src_positions"].numpy()
+    tgt = system["tgt_positions"].numpy()
+    qs = system["source_feats"][:, 0].numpy()
+    qt = system["target_feats"][:, 0].numpy()
+    images = _image_grid(cell, 5).numpy()
+    expected = 0.0
+    for s in range(src.shape[0]):
+        for t in range(tgt.shape[0]):
+            d = np.linalg.norm(src[s] + images - tgt[t], axis=1)
+            d = d[d <= 30.0]
+            k_new = erf(d / np.sqrt(2.0 * (SIGMA_D**2 + width**2))) / (d + 1e-6)
+            k_ref = erf(d / np.sqrt(2.0 * (2.0 * SIGMA_D**2))) / (d + 1e-6)
+            expected += qs[s] * qt[t] * np.sum(k_new - k_ref)
+    expected *= FIELD_CONSTANT / (4 * pi)
+    assert float(changed - default) == pytest.approx(expected, rel=1e-9, abs=1e-11)
+
+
+@pytest.mark.parametrize("width", [0.5, 2.0])
+def test_broader_and_intermediate_widths_periodic_vs_realspace(width):
+    cell = torch.diag(torch.tensor([60.0, 60.0, 60.0]))
+    centre = torch.tensor([30.0, 30.0, 30.0])
+    system = _system(5, 3, 4, 4, cell, seed=7)
+    system["src_positions"] = centre + 5.0 * (system["src_positions"] / 60.0 - 0.5)
+    system["tgt_positions"] = centre + 5.0 * (system["tgt_positions"] / 60.0 - 0.5)
+    # features
+    got = _field(GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "pbc"), source_width=width), _geometry(cell, True), system, cell)
+    expected = _field(GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "realspace"), source_width=width), _geometry(cell, False), system)
+    kspace_error = (
+        _field(GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "pbc")), _geometry(cell, True), system, cell)
+        - _field(GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "realspace")), _geometry(cell, False), system)
+    ).abs().max()
+    assert float((got - expected).abs().max()) <= 2.0 * float(kspace_error) + 1e-8
+    # energy
+    got_e = _cross(GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "pbc"), target_width=width), _geometry(cell, True), system, cell)
+    expected_e = _cross(GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "realspace"), target_width=width), _geometry(cell, False), system)
+    kspace_error_e = (
+        _cross(GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "pbc")), _geometry(cell, True), system, cell)
+        - _cross(GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "realspace")), _geometry(cell, False), system)
+    ).abs().max()
+    assert float((got_e - expected_e).abs().max()) <= 2.0 * float(kspace_error_e) + 1e-8
+
+
+def test_default_cutoff_grows_with_broad_widths():
+    narrow = GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "pbc"), source_width=0.0)
+    broad = GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "pbc"), source_width=10.0)
+    assert broad.effective_correction_cutoff > narrow.effective_correction_cutoff
+    assert broad.effective_correction_cutoff == pytest.approx(4.0 * np.sqrt(10.0**2 + max(FEATURE_WIDTHS) ** 2))
+    e_broad = GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "pbc"), target_width=10.0)
+    assert e_broad.effective_correction_cutoff == pytest.approx(4.0 * np.sqrt(SIGMA_D**2 + 10.0**2))
+
+
+def test_feature_width_correction_gradients_wrt_targets():
+    cell = torch.diag(torch.tensor([8.0, 8.0, 8.0]))
+    block = GTOElectrostaticExternalSourceFeatures.from_features(_features_block(1, 1, "pbc"), source_width=0.0)
+    system = _system(4, 3, 4, 1, cell, seed=9)
+    geometry = _geometry(cell, True)
+    weights = torch.randn(3, 4 * len(FEATURE_WIDTHS), generator=torch.Generator().manual_seed(11))
+
+    def scalar(tgt_positions):
+        trial = dict(system)
+        trial["tgt_positions"] = tgt_positions
+        return (weights * _field(block, geometry, trial, cell)).sum()
+
+    positions = system["tgt_positions"].clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(scalar(positions), positions)
+    h = 1e-5
+    for i, a in [(0, 1), (1, 0), (2, 2)]:
+        plus = system["tgt_positions"].clone(); plus[i, a] += h
+        minus = system["tgt_positions"].clone(); minus[i, a] -= h
+        torch.testing.assert_close(grad[i, a], (scalar(plus) - scalar(minus)) / (2 * h), rtol=1e-6, atol=1e-7)
+
+
+def test_energy_width_correction_gradients_wrt_sources():
+    cell = torch.diag(torch.tensor([8.0, 8.0, 8.0]))
+    block = GTOElectrostaticCrossEnergy.from_energy(_energy_block(1, "pbc"), target_width=0.0)
+    system = _system(4, 3, 4, 4, cell, seed=13)
+    geometry = _geometry(cell, True)
+
+    def scalar(src_positions):
+        trial = dict(system)
+        trial["src_positions"] = src_positions
+        return _cross(block, geometry, trial, cell).sum()
+
+    positions = system["src_positions"].clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(scalar(positions), positions)
+    h = 1e-5
+    for i, a in [(0, 2), (1, 1), (3, 0)]:
+        plus = system["src_positions"].clone(); plus[i, a] += h
+        minus = system["src_positions"].clone(); minus[i, a] -= h
+        torch.testing.assert_close(grad[i, a], (scalar(plus) - scalar(minus)) / (2 * h), rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_non_finite_or_negative_widths_rejected(bad):
+    with pytest.raises(ValueError):
+        GTOElectrostaticExternalSourceFeatures.from_features(_features_block(0, 0, "pbc"), source_width=bad)
+    with pytest.raises(ValueError):
+        GTOElectrostaticCrossEnergy.from_energy(_energy_block(0, "pbc"), target_width=bad)
+
+
+@pytest.mark.parametrize("bad", [0.0, -3.0, float("nan"), float("inf")])
+def test_bad_cutoffs_rejected(bad):
+    with pytest.raises(ValueError):
+        GTOElectrostaticExternalSourceFeatures.from_features(_features_block(0, 0, "pbc"), source_width=0.0, correction_cutoff=bad)
+    with pytest.raises(ValueError):
+        GTOElectrostaticCrossEnergy.from_energy(_energy_block(0, "pbc"), target_width=0.0, correction_cutoff=bad)
+
+
+def test_width_correction_rejects_higher_angular_orders():
+    # The library's real-space block only exists for l <= 1 (constructing a base
+    # with feature_max_l=2 already raises NotImplementedError), so emulate a
+    # higher-order block to check the wrapper's own guard.
+    base = _features_block(1, 1, "pbc")
+    base.realspace_features.projection_max_l = 2
+    GTOElectrostaticExternalSourceFeatures.from_features(base)  # default width still fine
+    with pytest.raises(ValueError, match="max_l <= 1"):
+        GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=0.0)

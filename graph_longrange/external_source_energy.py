@@ -78,8 +78,16 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
         # sources).  0.0 makes the targets point charges.  Reciprocal-space
         # paths keep the density width and add a real-space correction over
         # pairs within ``correction_cutoff`` (default 4*sqrt(2)*sigma_d).
-        if target_width is not None and float(target_width) < 0.0:
-            raise ValueError("target_width must be non-negative.")
+        if target_width is not None and not (
+            math.isfinite(float(target_width)) and float(target_width) >= 0.0
+        ):
+            raise ValueError(f"target_width must be finite and non-negative, got {target_width!r}.")
+        if correction_cutoff is not None and not (
+            math.isfinite(float(correction_cutoff)) and float(correction_cutoff) > 0.0
+        ):
+            raise ValueError(
+                f"correction_cutoff must be finite and positive, got {correction_cutoff!r}."
+            )
         self.target_width = None if target_width is None else float(target_width)
         self.correction_cutoff = (
             None if correction_cutoff is None else float(correction_cutoff)
@@ -237,7 +245,11 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
     def effective_correction_cutoff(self) -> float:
         if self.correction_cutoff is not None:
             return self.correction_cutoff
-        return 4.0 * math.sqrt(2.0) * float(self.density_smearing_width)
+        # decay is set by the broader of the two target widths combined with the
+        # (density-width) source: erfc(4/sqrt(2)) ~ 6e-5
+        sigma_d = float(self.density_smearing_width)
+        broad = max(sigma_d, float(self.target_width or 0.0))
+        return 4.0 * math.sqrt(sigma_d**2 + broad**2)
 
     def _width_correction(
         self,
@@ -279,18 +291,32 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
         n_src_rep = source_q.shape[0] // source_positions.shape[0]
         n_tgt_rep = target_q.shape[0] // target_positions.shape[0]
         edge_index, shifts = expand_edges_displaced(edge_index, shifts, n_src_rep, n_tgt_rep)
-        sender, receiver = edge_index
-        displacement = source_pos[sender] + shifts - target_pos[receiver]
-        distance = torch.linalg.norm(displacement, dim=-1)
         sigma_new = self._pair_sigma(self.target_width)
         sigma_ref = self._pair_sigma(None)
-        kernel = (
-            torch.erf(0.5 * distance / sigma_new) - torch.erf(0.5 * distance / sigma_ref)
-        ) / (distance.abs() + 1e-6)
-        pair_energy = (
-            FIELD_CONSTANT / (4.0 * math.pi) * source_q[sender] * target_q[receiver] * kernel
+        prefactor = FIELD_CONSTANT / (4.0 * math.pi)
+        # evaluate the expanded edges in chunks bounded by the real-space budget
+        step = self._resolve_chunk(
+            self.realspace_chunk_size,
+            edge_index.shape[1],
+            1,
+            source_positions.element_size(),
+            self.realspace_chunk_budget_bytes,
+            arrays_per_pair=8,
         )
-        return scatter_sum(pair_energy, source_graph[sender], dim=0, dim_size=num_graphs)
+        total = source_positions.new_zeros(num_graphs)
+        for start in range(0, edge_index.shape[1], step):
+            sender = edge_index[0, start : start + step]
+            receiver = edge_index[1, start : start + step]
+            displacement = source_pos[sender] + shifts[start : start + step] - target_pos[receiver]
+            distance = torch.linalg.norm(displacement, dim=-1)
+            kernel = (
+                torch.erf(0.5 * distance / sigma_new) - torch.erf(0.5 * distance / sigma_ref)
+            ) / (distance.abs() + 1e-6)
+            pair_energy = prefactor * source_q[sender] * target_q[receiver] * kernel
+            total = total + scatter_sum(
+                pair_energy, source_graph[sender], dim=0, dim_size=num_graphs
+            )
+        return total
 
     def _forward_realspace(
         self,

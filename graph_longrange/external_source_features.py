@@ -151,10 +151,11 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
     ``density_smearing_width``; ``0.0`` makes them point charges and any value
     in between a narrower Gaussian.  Reciprocal-space paths keep evaluating the
     density-width sources and add a real-space correction over source-target
-    pairs within ``correction_cutoff`` (default ``4 * sqrt(sigma_d^2 +
-    max(sigma_f)^2)``, where the erf-difference kernel has decayed to about
-    1e-5 of 1/r), including periodic images; the real-space path uses the
-    requested width directly.
+    pairs within ``correction_cutoff`` (default ``4 * sqrt(max(sigma_d,
+    source_width)^2 + max(sigma_f)^2)``, where the erf-difference kernel has
+    decayed to about 6e-5 of 1/r), including periodic images; the real-space
+    path uses the requested width directly.  Supported for density and feature
+    angular orders up to 1 (the real-space finite-difference block).
     """
 
     _EXTERNAL_FIELD_CACHE_KEY = "_graph_longrange_external_field"
@@ -172,12 +173,29 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         super().__init__()
         self.base = base
         self.external_scale = float(external_scale)
-        if source_width is not None and float(source_width) < 0.0:
-            raise ValueError("source_width must be non-negative.")
+        if source_width is not None and not (
+            math.isfinite(float(source_width)) and float(source_width) >= 0.0
+        ):
+            raise ValueError(f"source_width must be finite and non-negative, got {source_width!r}.")
+        if correction_cutoff is not None and not (
+            math.isfinite(float(correction_cutoff)) and float(correction_cutoff) > 0.0
+        ):
+            raise ValueError(
+                f"correction_cutoff must be finite and positive, got {correction_cutoff!r}."
+            )
         self.source_width = None if source_width is None else float(source_width)
         self.correction_cutoff = (
             None if correction_cutoff is None else float(correction_cutoff)
         )
+        if self._needs_width_correction:
+            block = self.base.realspace_features
+            if int(block.density_max_l) > 1 or int(block.projection_max_l) > 1:
+                raise ValueError(
+                    "source_width other than the density width is implemented for "
+                    "density_max_l <= 1 and feature_max_l <= 1 (the real-space "
+                    "finite-difference block); got "
+                    f"{block.density_max_l} / {block.projection_max_l}."
+                )
         self.method = method
         self.use_pme = isinstance(method, str) and method.upper() == "PME"
         if self.use_pme and pme_mesh_factor < 1.0:
@@ -224,9 +242,12 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
     def effective_correction_cutoff(self) -> float:
         if self.correction_cutoff is not None:
             return self.correction_cutoff
+        # The erf-difference kernel decays with the BROADER of the two source
+        # widths combined with the widest feature width: erfc(4/sqrt(2)) ~ 6e-5.
         block = self.base.realspace_features
         widest = max(float(w) for w in block.projection_smearing_widths)
-        return 4.0 * math.sqrt(float(block.density_smearing_width) ** 2 + widest**2)
+        broad = max(float(block.density_smearing_width), float(self.source_width or 0.0))
+        return 4.0 * math.sqrt(broad**2 + widest**2)
 
     def _width_pairs(
         self,
