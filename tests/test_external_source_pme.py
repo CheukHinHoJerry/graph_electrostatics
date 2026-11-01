@@ -458,12 +458,19 @@ def test_pme_auto_without_periodicity_needs_no_cell():
 def test_pme_missing_torchpme_raises_import_error(monkeypatch):
     import graph_longrange.external_source_pme as pme_module
 
-    monkeypatch.setattr(pme_module, "MeshInterpolator", None)
     cells = _cells()[:1]
-    _, pme = _pair(0, 0, "pbc")
     system = _system(cells, [5], [2], 1)
+    # a block built while torch-pme was importable still fails loudly at
+    # evaluation time if the package disappears
+    _, pme = _pair(0, 0, "pbc")
+    monkeypatch.setattr(pme_module, "MeshInterpolator", None)
     with pytest.raises(ImportError, match="torch-pme"):
         _features(pme, _geometry(cells, "pbc"), system, cell=cells)
+    # and without torch-pme the PME wrapper cannot even be constructed
+    with pytest.raises(ImportError, match="torch-pme"):
+        _pair(0, 0, "pbc")
+    # the direct method never needs it
+    GTOElectrostaticExternalSourceFeatures.from_features(_base(0, 0, "pbc"))
 
 
 @needs_torchpme

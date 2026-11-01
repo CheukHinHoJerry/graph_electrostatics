@@ -25,6 +25,7 @@ from .external_source_realspace import (
     bipartite_pairs_within_cutoff,
 )
 from .external_source_pme import (
+    _require_torchpme,
     PME_DEFAULT_INTERPOLATION_NODES, PME_DEFAULT_MESH_FACTOR,
     assemble_density_from_structure_factor, precompute_pme_source_geometry,
     pme_structure_factor,
@@ -202,6 +203,10 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
                 )
         self.method = method
         self.use_pme = isinstance(method, str) and method.upper() == "PME"
+        if self.use_pme:
+            # torch-pme is an optional dependency: fail at construction with a
+            # clear message rather than at the first periodic evaluation.
+            _require_torchpme()
         if self.use_pme and pme_mesh_factor < 1.0:
             raise ValueError("pme_mesh_factor must be at least 1.0.")
         self.pme_interpolation_nodes = int(pme_interpolation_nodes)
