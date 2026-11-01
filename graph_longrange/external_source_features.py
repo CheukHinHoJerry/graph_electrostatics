@@ -169,10 +169,14 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
         source_width: Optional[float] = None,
         correction_cutoff: Optional[float] = None,
+        correction_budget_bytes: int = 256 << 20,
     ) -> None:
         super().__init__()
         self.base = base
         self.external_scale = float(external_scale)
+        # bounds the working memory of the width correction (pair search and
+        # kernel evaluation); the stored pair list itself is not bounded by it
+        self.correction_budget_bytes = int(correction_budget_bytes)
         if source_width is not None and not (
             math.isfinite(float(source_width)) and float(source_width) >= 0.0
         ):
@@ -217,6 +221,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
         pme_mesh_factor: float = PME_DEFAULT_MESH_FACTOR,
         source_width: Optional[float] = None,
         correction_cutoff: Optional[float] = None,
+        correction_budget_bytes: int = 256 << 20,
     ) -> "GTOElectrostaticExternalSourceFeatures":
         """Wrap an existing feature block without changing its parameters."""
         return cls(
@@ -227,6 +232,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             pme_mesh_factor=pme_mesh_factor,
             source_width=source_width,
             correction_cutoff=correction_cutoff,
+            correction_budget_bytes=correction_budget_bytes,
         )
 
     # ---- source width -----------------------------------------------------
@@ -274,6 +280,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             self.effective_correction_cutoff,
             cell=cell,
             pbc=pbc,
+            pair_budget=max(1, self.correction_budget_bytes // (3 * src_positions.element_size())),
         )
         return {"width_edge_index": edge_index, "width_shifts": shifts}
 
@@ -293,6 +300,7 @@ class GTOElectrostaticExternalSourceFeatures(torch.nn.Module):
             edge_index=cache["width_edge_index"],
             shifts=cache["width_shifts"],
             source_width=self.source_width,
+            budget_bytes=self.correction_budget_bytes,
         )
         return features + correction
 

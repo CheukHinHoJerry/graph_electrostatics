@@ -648,3 +648,38 @@ def test_width_correction_rejects_higher_angular_orders():
     GTOElectrostaticExternalSourceFeatures.from_features(base)  # default width still fine
     with pytest.raises(ValueError, match="max_l <= 1"):
         GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=0.0)
+
+
+# ------------------------------------------------- review follow-ups (round 2)
+
+
+@pytest.mark.parametrize("density_max_l,feature_max_l", [(0, 0), (1, 1), (1, 0), (0, 1)])
+def test_feature_correction_is_independent_of_chunking(density_max_l, feature_max_l):
+    cell = torch.diag(torch.tensor([8.0, 9.0, 10.0]))
+    base = _features_block(density_max_l, feature_max_l, "pbc")
+    system = _system(9, 5, (density_max_l + 1) ** 2, 1, cell, seed=21)
+    geometry = _geometry(cell, True)
+    big = GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=0.3)
+    tiny = GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=0.3, correction_budget_bytes=1)
+    torch.testing.assert_close(_field(tiny, geometry, system, cell), _field(big, geometry, system, cell), rtol=1e-9, atol=1e-10)  # summation order
+
+
+@pytest.mark.parametrize("density_max_l", [0, 1])
+def test_energy_correction_is_independent_of_chunking(density_max_l):
+    cell = torch.diag(torch.tensor([8.0, 9.0, 10.0]))
+    m = (density_max_l + 1) ** 2
+    system = _system(9, 5, m, m, cell, seed=22)
+    geometry = _geometry(cell, True)
+    big = GTOElectrostaticCrossEnergy.from_energy(_energy_block(density_max_l, "pbc"), target_width=0.3)
+    tiny = GTOElectrostaticCrossEnergy.from_energy(
+        _energy_block(density_max_l, "pbc"), target_width=0.3, realspace_chunk_size=1, realspace_chunk_budget_bytes=1
+    )
+    torch.testing.assert_close(_cross(tiny, geometry, system, cell), _cross(big, geometry, system, cell), rtol=1e-9, atol=1e-10)
+
+
+def test_width_correction_rejects_higher_density_order_too():
+    base = _features_block(1, 1, "pbc")
+    base.realspace_features.density_max_l = 2
+    GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=SIGMA_D)  # equal width: no correction
+    with pytest.raises(ValueError, match="max_l <= 1"):
+        GTOElectrostaticExternalSourceFeatures.from_features(base, source_width=0.0)

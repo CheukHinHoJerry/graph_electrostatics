@@ -395,37 +395,79 @@ class _ExternalSourceRealspace:
         edge_index: torch.Tensor,
         shifts: torch.Tensor,
         source_width: float,
-        edge_chunk: int = 1 << 18,
+        budget_bytes: int = 256 << 20,
     ) -> torch.Tensor:
         """Field of ``source_width`` sources minus the field of density-width sources,
-        summed over the given pairs only. Added to a reciprocal-space result that
-        treated the sources with the density width, it turns them into sources of
-        width ``source_width`` (0 = point charges). The difference of the two erf
-        kernels decays like erfc, which is what makes a cutoff admissible."""
+        summed over the given node pairs only. Added to a reciprocal-space result
+        that treated the sources with the density width, it turns them into sources
+        of width ``source_width`` (0 = point charges). The difference of the two erf
+        kernels decays like erfc, which is what makes a cutoff admissible.
+
+        Memory: the displaced-charge representations are built once; the node
+        pairs are then evaluated in chunks sized so that the expanded (up to
+        16-fold) pair temporaries stay within ``budget_bytes``."""
+        if source_feats.dim() == 3:
+            source_feats = source_feats.squeeze(-2)
+        n_tgt = tgt_positions.shape[0]
+        n_radial = self.num_radial
+        scalar_only = self.density_max_l == 0 and self.projection_max_l == 0
+        n_out = n_radial if self.projection_max_l == 0 else 4 * n_radial
         if edge_index.shape[1] == 0:
-            n_out = (
-                self.num_radial
-                if self.projection_max_l == 0
-                else 4 * self.num_radial
+            return tgt_positions.new_zeros((n_tgt, n_out))
+        narrow_factors = source_width_factors(
+            source_width, self.projection_smearing_widths, self.total_width_factors
+        ).unsqueeze(0)
+        reference_factors = self.total_width_factors.unsqueeze(0)
+
+        if scalar_only:
+            charges = source_feats[:, 0]
+            src_pos, tgt_pos, rep = src_positions, tgt_positions, 1
+        else:
+            # Build the displaced representations ONCE (sources: charges and
+            # dipoles as displaced charges; targets: the l=1 finite-difference
+            # receive sites), exactly as call_source_target_density_1_feats_1.
+            if source_feats.shape[-1] == 1:
+                padded = source_feats.new_zeros((source_feats.shape[0], 4))
+                padded[:, 0] = source_feats[:, 0]
+                source_feats = padded
+            src_pos = src_positions.repeat_interleave(4, dim=0)
+            src_pos[1::4] += self.x
+            src_pos[2::4] += self.y
+            src_pos[3::4] += self.z
+            charges = torch.zeros_like(src_pos[:, 0])
+            charges[1::4] = source_feats[:, 3] / self.offset
+            charges[2::4] = source_feats[:, 1] / self.offset
+            charges[3::4] = source_feats[:, 2] / self.offset
+            charges[0::4] = source_feats[:, 0] - (charges[1::4] + charges[2::4] + charges[3::4])
+            tgt_pos = tgt_positions.repeat_interleave(4, dim=0)
+            tgt_pos[1::4] += self.x
+            tgt_pos[2::4] += self.y
+            tgt_pos[3::4] += self.z
+            rep = 4
+
+        # per expanded pair: displacement (3) + distance + two kernels, n_radial wide
+        bytes_per_pair = src_positions.element_size() * (3 + 1 + 2 * n_radial) * rep * rep
+        step = max(1, int(budget_bytes) // max(1, bytes_per_pair))
+        scalar = tgt_positions.new_zeros((n_tgt * rep, n_radial))
+        for start in range(0, edge_index.shape[1], step):
+            chunk = edge_index[:, start : start + step]
+            chunk_shifts = shifts[start : start + step]
+            if rep > 1:
+                chunk, chunk_shifts = expand_edges_displaced(chunk, chunk_shifts, rep, rep)
+            scalar = scalar + charges_features_from_bipartite_graph(
+                charges, src_pos, tgt_pos, chunk, n_tgt * rep, narrow_factors, chunk_shifts
+            ) - charges_features_from_bipartite_graph(
+                charges, src_pos, tgt_pos, chunk, n_tgt * rep, reference_factors, chunk_shifts
             )
-            return tgt_positions.new_zeros((tgt_positions.shape[0], n_out))
-        common = (source_feats, src_positions, src_batch, tgt_positions, tgt_batch)
-        # Bounded memory: the l=1 path expands every pair 16-fold, so evaluate
-        # the pairs in chunks and accumulate (the sum is linear in the edges).
-        n_edges = edge_index.shape[1]
-        step = max(1, int(edge_chunk))
-        total = None
-        for start in range(0, n_edges, step):
-            sl = slice(start, min(start + step, n_edges))
-            narrow = self.forward_source_target(
-                *common, edge_index=edge_index[:, sl], shifts=shifts[sl], source_width=source_width
-            )
-            reference = self.forward_source_target(
-                *common,
-                edge_index=edge_index[:, sl],
-                shifts=shifts[sl],
-                source_width=self.density_smearing_width,
-            )
-            total = narrow - reference if total is None else total + (narrow - reference)
-        return total
+
+        if scalar_only:
+            return self.l0_factors * scalar
+        out = tgt_positions.new_zeros((n_tgt, 4 * n_radial))
+        out[:, :n_radial] = self.l0_factors * scalar[0::4]
+        out[:, n_radial::3] = self.l1_factors * (scalar[2::4] - scalar[0::4])
+        out[:, n_radial + 1 :: 3] = self.l1_factors * (scalar[3::4] - scalar[0::4])
+        out[:, n_radial + 2 :: 3] = self.l1_factors * (scalar[1::4] - scalar[0::4])
+        if self.projection_max_l == 0:
+            return out[:, :n_radial]
+        return out
 

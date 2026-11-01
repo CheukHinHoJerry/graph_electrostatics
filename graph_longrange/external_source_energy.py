@@ -279,6 +279,9 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
             self.effective_correction_cutoff,
             cell=cell,
             pbc=pbc,
+            pair_budget=max(
+                1, int(self.realspace_chunk_budget_bytes) // (3 * source_positions.element_size())
+            ),
         )
         if edge_index.shape[1] == 0:
             return source_positions.new_zeros(num_graphs)
@@ -290,24 +293,28 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
         )
         n_src_rep = source_q.shape[0] // source_positions.shape[0]
         n_tgt_rep = target_q.shape[0] // target_positions.shape[0]
-        edge_index, shifts = expand_edges_displaced(edge_index, shifts, n_src_rep, n_tgt_rep)
         sigma_new = self._pair_sigma(self.target_width)
         sigma_ref = self._pair_sigma(None)
         prefactor = FIELD_CONSTANT / (4.0 * math.pi)
-        # evaluate the expanded edges in chunks bounded by the real-space budget
+        # Evaluate node pairs in chunks: each chunk is expanded to its displaced
+        # pairs (up to 16x) only when it is evaluated, so the expanded temporaries
+        # stay within the real-space budget (8 arrays per expanded pair).
         step = self._resolve_chunk(
             self.realspace_chunk_size,
             edge_index.shape[1],
-            1,
+            n_src_rep * n_tgt_rep,
             source_positions.element_size(),
             self.realspace_chunk_budget_bytes,
             arrays_per_pair=8,
         )
         total = source_positions.new_zeros(num_graphs)
         for start in range(0, edge_index.shape[1], step):
-            sender = edge_index[0, start : start + step]
-            receiver = edge_index[1, start : start + step]
-            displacement = source_pos[sender] + shifts[start : start + step] - target_pos[receiver]
+            chunk = edge_index[:, start : start + step]
+            chunk_shifts = shifts[start : start + step]
+            if n_src_rep > 1 or n_tgt_rep > 1:
+                chunk, chunk_shifts = expand_edges_displaced(chunk, chunk_shifts, n_src_rep, n_tgt_rep)
+            sender, receiver = chunk
+            displacement = source_pos[sender] + chunk_shifts - target_pos[receiver]
             distance = torch.linalg.norm(displacement, dim=-1)
             kernel = (
                 torch.erf(0.5 * distance / sigma_new) - torch.erf(0.5 * distance / sigma_ref)
